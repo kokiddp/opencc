@@ -1,8 +1,6 @@
 # opencc
 
-Bash wrapper for running **Claude Code** against alternative backends. Unifies
-the two previous scripts (`cc-go` and `opencc`) into a single tool with three
-backends:
+Bash wrapper for running **Claude Code** against alternative backends:
 
 | Backend     | What it uses | Authentication | Proxy |
 |-------------|--------------|----------------|-------|
@@ -262,9 +260,6 @@ openai/              last-model, last-effort, model-picker.json,
 go/                  last-model, last-effort, model-picker.json,
                      model-efforts.json, models.tsv, models.ids
 ```
-
-State from the old scripts is migrated automatically on first run
-(`~/.local/state/opencc/*` → `openai/`, `~/.local/state/cc-go/*` → `go/`).
 
 ## Notes
 

@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# opencc — runs Claude Code against alternative backends.
-#
-# Unifies the two previous wrappers (`cc-go` and `opencc`) into a single tool
-# with three selectable backends:
+# opencc — runs Claude Code against alternative backends:
 #
 #   go        the opencode-go gateway from OpenCode (https://opencode.ai/zen/go).
 #             Authenticates via the x-api-key header; a local pass-through
@@ -108,13 +105,6 @@ mkdir -p "$STATE_ROOT/go" "$STATE_ROOT/openai"
 for f in last-model last-effort; do
   [[ -f "$STATE_ROOT/$f" && ! -f "$STATE_ROOT/openai/$f" ]] && mv -f "$STATE_ROOT/$f" "$STATE_ROOT/openai/$f"
 done
-# cc-go kept its own state in ~/.local/state/cc-go.
-if [[ -d "$HOME/.local/state/cc-go" ]]; then
-  for f in last-model last-effort models.tsv models.ids; do
-    [[ -f "$HOME/.local/state/cc-go/$f" && ! -f "$STATE_ROOT/go/$f" ]] && \
-      cp -f "$HOME/.local/state/cc-go/$f" "$STATE_ROOT/go/$f"
-  done
-fi
 
 # --- 2) Backend selection -----------------------------------------------------
 BACKEND="${OPENCC_BACKEND:-}"
@@ -225,10 +215,6 @@ for mid in sys.argv[1].splitlines():
     return 1
   }
 
-  # The cache inherited from cc-go has 3 columns: rebuild it in the 5-column format.
-  if [[ -s "$MODELS_CACHE" ]] && [[ "$(head -n1 "$MODELS_CACHE" | awk -F'\t' '{print NF}')" != "5" ]]; then
-    rm -f "$MODELS_CACHE"
-  fi
   [[ -s "$MODELS_CACHE" ]] || build_go_models_tsv >/dev/null 2>&1 || true
 
   # NB: $(<file) must not be combined with a redirect or `|| true` (yields empty output).
