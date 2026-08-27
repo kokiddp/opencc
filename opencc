@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# opencc — avvia Claude Code su backend alternativi.
+# opencc — runs Claude Code against alternative backends.
 #
-# Unifica i due wrapper precedenti (`cc-go` e `opencc`) in un unico tool con tre
-# backend selezionabili:
+# Unifies the two previous wrappers (`cc-go` and `opencc`) into a single tool
+# with three selectable backends:
 #
-#   go      gateway opencode-go di OpenCode (https://opencode.ai/zen/go).
-#           Autenticazione via header x-api-key; un proxy locale pass-through
-#           normalizza l'effort in base al modello selezionato.
-#   openai  modelli OpenAI tramite abbonamento ChatGPT (token OAuth del CLI
-#           Codex) o API key, attraverso il proxy locale `opencc-proxy.mjs` che
-#           traduce il protocollo Anthropic in Responses.
-#   anthropic comportamento standard di Claude Code: pass-through puro, senza
-#             modificare endpoint, autenticazione, modello, effort o settings.
+#   go        the opencode-go gateway from OpenCode (https://opencode.ai/zen/go).
+#             Authenticates via the x-api-key header; a local pass-through
+#             proxy normalizes the effort for the selected model.
+#   openai    OpenAI models via a ChatGPT subscription (Codex CLI OAuth token)
+#             or an API key, through the local proxy `opencc-proxy.mjs`, which
+#             translates the Anthropic protocol into Responses.
+#   anthropic stock Claude Code behavior: pure pass-through, without touching
+#             endpoint, authentication, model, effort or settings.
 #
-# Comandi:
-#   opencc login                  login ChatGPT (device flow del CLI Codex)
-#   opencc [argomenti per claude] menu backend + modelli + ragionamento, poi avvia
+# Commands:
+#   opencc login                  ChatGPT login (Codex CLI device flow)
+#   opencc [args for claude]      backend + models + reasoning menu, then launch
 #
-# Variabili:
-#   OPENCC_BACKEND    go | openai | anthropic  (salta il menu backend)
-#   OPENCC_MODE       subscription | apikey  (solo backend openai)
-#   OPENCC_PROXY_PORT porta del proxy locale (default 3199, openai e go)
+# Variables:
+#   OPENCC_BACKEND    go | openai | anthropic  (skips the backend menu)
+#   OPENCC_MODE       subscription | apikey  (openai backend only)
+#   OPENCC_PROXY_PORT local proxy port (default 3199, openai and go)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Configurazione backend go ------------------------------------------------
+# --- Go backend configuration -------------------------------------------------
 GO_BASE_URL="https://opencode.ai/zen/go"
 GO_MODELS_URL="https://opencode.ai/zen/go/v1/models"
 GO_CATALOG_URL="https://models.opencode.ai/api.json"
@@ -34,7 +34,7 @@ GO_FALLBACK_MODEL="minimax-m3"
 GO_MODELS_MAX_AGE=$((7 * 24 * 3600))
 GO_AUTH_JSON="$HOME/.local/share/opencode/auth.json"
 
-# --- Configurazione backend openai --------------------------------------------
+# --- OpenAI backend configuration ---------------------------------------------
 PROXY_SCRIPT="$SCRIPT_DIR/opencc-proxy.mjs"
 EXPECTED_PROXY_VERSION="5"
 PORT="${OPENCC_PROXY_PORT:-3199}"
@@ -42,7 +42,7 @@ PROXY_BASE_URL="http://127.0.0.1:$PORT"
 CODEX_AUTH="$HOME/.codex/auth.json"
 CODEX_MODELS_CACHE="$HOME/.codex/models_cache.json"
 
-# Elenco di ripiego se non si riesce a recuperare i modelli OpenAI.
+# Fallback model list if the OpenAI models cannot be fetched.
 OPENAI_FALLBACK_MODELS="gpt-5.6-sol
 gpt-5.6-terra
 gpt-5.6-luna
@@ -50,14 +50,14 @@ gpt-5.5
 gpt-5.4
 gpt-5.4-mini"
 
-# --- Stato --------------------------------------------------------------------
+# --- State --------------------------------------------------------------------
 STATE_ROOT="$HOME/.local/state/opencc"
 BACKEND_FILE="$STATE_ROOT/last-backend"
 
 require_base_tools() {
   local cmd
   for cmd in curl python3; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "Errore: '$cmd' non trovato nel PATH." >&2; exit 1; }
+    command -v "$cmd" >/dev/null 2>&1 || { echo "Error: '$cmd' not found on PATH." >&2; exit 1; }
   done
 }
 
@@ -82,33 +82,33 @@ PY
 
 codex_login() {
   if ! command -v codex >/dev/null 2>&1; then
-    echo "Errore: il CLI Codex non è installato." >&2
-    echo "        Installalo (https://github.com/openai/codex) oppure usa la modalità apikey (OPENAI_API_KEY)." >&2
+    echo "Error: the Codex CLI is not installed." >&2
+    echo "        Install it (https://github.com/openai/codex) or use apikey mode (OPENAI_API_KEY)." >&2
     return 1
   fi
-  echo "Avvio login ChatGPT (device flow: apri il link e inserisci il codice)..."
+  echo "Starting ChatGPT login (device flow: open the link and enter the code)..."
   codex login --device-auth
 }
 
-# --- 0) Comando `login` -------------------------------------------------------
+# --- 0) `login` command -------------------------------------------------------
 if [[ "${1:-}" == "login" ]]; then
   require_base_tools
   codex_login || exit 1
   if has_codex_auth; then
-    echo "Login completato: $CODEX_AUTH aggiornato."
+    echo "Login completed: $CODEX_AUTH updated."
     exit 0
   fi
-  echo "Errore: login non riuscito ($CODEX_AUTH senza token)." >&2
+  echo "Error: login failed ($CODEX_AUTH has no token)." >&2
   exit 1
 fi
 
-# --- 1) Migrazione dello stato dei vecchi script ------------------------------
+# --- 1) Migration of state from the old scripts -------------------------------
 mkdir -p "$STATE_ROOT/go" "$STATE_ROOT/openai"
-# opencc <= 1 teneva lo stato OpenAI direttamente in $STATE_ROOT.
+# opencc <= 1 kept the OpenAI state directly in $STATE_ROOT.
 for f in last-model last-effort; do
   [[ -f "$STATE_ROOT/$f" && ! -f "$STATE_ROOT/openai/$f" ]] && mv -f "$STATE_ROOT/$f" "$STATE_ROOT/openai/$f"
 done
-# cc-go teneva il proprio stato in ~/.local/state/cc-go.
+# cc-go kept its own state in ~/.local/state/cc-go.
 if [[ -d "$HOME/.local/state/cc-go" ]]; then
   for f in last-model last-effort models.tsv models.ids; do
     [[ -f "$HOME/.local/state/cc-go/$f" && ! -f "$STATE_ROOT/go/$f" ]] && \
@@ -116,7 +116,7 @@ if [[ -d "$HOME/.local/state/cc-go" ]]; then
   done
 fi
 
-# --- 2) Scelta del backend ----------------------------------------------------
+# --- 2) Backend selection -----------------------------------------------------
 BACKEND="${OPENCC_BACKEND:-}"
 if [[ -z "$BACKEND" ]]; then
   BACKEND_DEFAULT="openai"
@@ -124,49 +124,49 @@ if [[ -z "$BACKEND" ]]; then
     STORED_BACKEND="$(<"$BACKEND_FILE")"
     [[ "$STORED_BACKEND" == "go" || "$STORED_BACKEND" == "openai" || "$STORED_BACKEND" == "anthropic" ]] && BACKEND_DEFAULT="$STORED_BACKEND"
   fi
-  echo "Backend disponibili:"
-  echo "   1) openai  — modelli OpenAI (abbonamento ChatGPT o API key, proxy locale)"
-  echo "   2) go      — gateway OpenCode Go (x-api-key)"
-  echo "   0) anthropic — Claude Code standard (pass-through, nessuna modifica)"
+  echo "Available backends:"
+  echo "   1) openai  — OpenAI models (ChatGPT subscription or API key, local proxy)"
+  echo "   2) go      — OpenCode Go gateway (x-api-key)"
+  echo "   0) anthropic — stock Claude Code (pass-through, no changes)"
   while true; do
-    printf "\nScegli il backend [0-2] (invio/d = %s): " "$BACKEND_DEFAULT"
+    printf "\nChoose backend [0-2] (enter/d = %s): " "$BACKEND_DEFAULT"
     read -r CHOICE || CHOICE=""
     case "$CHOICE" in
       ""|d) BACKEND="$BACKEND_DEFAULT"; break ;;
       0|anthropic) BACKEND="anthropic"; break ;;
       1|openai) BACKEND="openai"; break ;;
       2|go) BACKEND="go"; break ;;
-      *) echo "Scelta non valida, riprova." ;;
+      *) echo "Invalid choice, try again." ;;
     esac
   done
 fi
 case "$BACKEND" in
   go|openai|anthropic) ;;
-  *) echo "Errore: backend non valido ('$BACKEND'); usa go, openai o anthropic." >&2; exit 1 ;;
+  *) echo "Error: invalid backend ('$BACKEND'); use go, openai or anthropic." >&2; exit 1 ;;
 esac
 printf '%s\n' "$BACKEND" > "$BACKEND_FILE"
 
 if [[ "$BACKEND" == "anthropic" ]]; then
-  echo "Avvio Claude Code standard (backend: anthropic)."
+  echo "Starting stock Claude Code (backend: anthropic)."
   exec claude "$@"
 fi
 
 require_base_tools
-command -v node >/dev/null 2>&1 || { echo "Errore: 'node' non trovato nel PATH (richiesto dal proxy)." >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "Error: 'node' not found on PATH (required by the proxy)." >&2; exit 1; }
 
 STATE_DIR="$STATE_ROOT/$BACKEND"
 STATE_FILE="$STATE_DIR/last-model"
 STATE_EFFORT_FILE="$STATE_DIR/last-effort"
 MODELS_CACHE="$STATE_DIR/models.tsv"
 
-# --- 3) Credenziali e elenco modelli ------------------------------------------
-# Formato TSV comune: slug<TAB>nome<TAB>contesto<TAB>livelli di ragionamento<TAB>default
+# --- 3) Credentials and model list --------------------------------------------
+# Shared TSV format: slug<TAB>name<TAB>context<TAB>reasoning levels<TAB>default
 MODELS=""
 MODE=""
 KEY=""
 
 if [[ "$BACKEND" == "go" ]]; then
-  # API key: env OPENCODE_API_KEY, fallback auth.json (parsing con python3, niente jq)
+  # API key: OPENCODE_API_KEY env var, falling back to auth.json (parsed with python3, no jq)
   if [[ -n "${OPENCODE_API_KEY:-}" ]]; then
     KEY="$OPENCODE_API_KEY"
   elif [[ -f "$GO_AUTH_JSON" ]]; then
@@ -181,12 +181,12 @@ PY
 )"
   fi
   if [[ -z "$KEY" ]]; then
-    echo "Errore: nessuna API key trovata (setta OPENCODE_API_KEY o fai login con opencode)." >&2
+    echo "Error: no API key found (set OPENCODE_API_KEY or log in with opencode)." >&2
     exit 1
   fi
 
-  # Cache modelli: elenco da /v1/models, contesto ed effort dal catalogo upstream.
-  # Costruita una tantum e rinfrescata in background quando scaduta.
+  # Model cache: list from /v1/models, context and effort from the upstream
+  # catalog. Built once and refreshed in the background when stale.
   build_go_models_tsv() {
     local ids tmp
     ids="$(curl -fsS -m 15 -H "x-api-key: $KEY" "$GO_MODELS_URL" 2>/dev/null | python3 -c '
@@ -200,7 +200,7 @@ except Exception:
     tmp="$(mktemp "$MODELS_CACHE.XXXXXX")" || return 1
     if curl -fsS -m 25 "$GO_CATALOG_URL" 2>/dev/null | python3 -c '
 import json, sys
-# Claude Code accetta questi livelli in --effort: intersecali con quelli del modello.
+# Claude Code accepts these levels in --effort: intersect them with the model.
 CLAUDE_EFFORTS = {"low","medium","high","xhigh","max"}
 try:
     cat = json.load(sys.stdin)
@@ -225,16 +225,16 @@ for mid in sys.argv[1].splitlines():
     return 1
   }
 
-  # La cache ereditata da cc-go ha 3 colonne: rigenerala nel formato a 5 colonne.
+  # The cache inherited from cc-go has 3 columns: rebuild it in the 5-column format.
   if [[ -s "$MODELS_CACHE" ]] && [[ "$(head -n1 "$MODELS_CACHE" | awk -F'\t' '{print NF}')" != "5" ]]; then
     rm -f "$MODELS_CACHE"
   fi
   [[ -s "$MODELS_CACHE" ]] || build_go_models_tsv >/dev/null 2>&1 || true
 
-  # NB: $(<file) non va combinato con redirect o `|| true` (produce output vuoto).
+  # NB: $(<file) must not be combined with a redirect or `|| true` (yields empty output).
   if [[ -s "$MODELS_CACHE" ]]; then
     MODELS="$(<"$MODELS_CACHE")"
-    # Cache scaduta: rinfresca senza bloccare l'avvio.
+    # Stale cache: refresh without blocking startup.
     cache_age=$(( $(date +%s) - $(stat -c %Y "$MODELS_CACHE" 2>/dev/null || echo 0) ))
     (( cache_age > GO_MODELS_MAX_AGE )) && { build_go_models_tsv >/dev/null 2>&1 & disown; }
   fi
@@ -243,7 +243,7 @@ for mid in sys.argv[1].splitlines():
   fi
 
 else
-  # Modalità di autenticazione: subscription (predefinita) o apikey.
+  # Authentication mode: subscription (default) or apikey.
   MODE="${OPENCC_MODE:-}"
   if [[ -z "$MODE" ]]; then
     if has_codex_auth; then
@@ -251,35 +251,35 @@ else
     elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
       MODE="apikey"
     else
-      # Nessuna credenziale: proponi il login subscription (prompt qui sotto).
+      # No credentials: offer the subscription login (prompt below).
       MODE="subscription"
     fi
   fi
   case "$MODE" in
     subscription|apikey) ;;
-    *) echo "Errore: OPENCC_MODE non valido ('$MODE'); usa subscription o apikey." >&2; exit 1 ;;
+    *) echo "Error: invalid OPENCC_MODE ('$MODE'); use subscription or apikey." >&2; exit 1 ;;
   esac
   if [[ "$MODE" == "apikey" && -z "${OPENAI_API_KEY:-}" ]]; then
-    echo "Errore: modalità apikey richiede OPENAI_API_KEY." >&2
+    echo "Error: apikey mode requires OPENAI_API_KEY." >&2
     exit 1
   fi
 
-  # Autenticazione subscription mancante: proponi il login.
+  # Missing subscription auth: offer the login.
   if [[ "$MODE" == "subscription" ]] && ! has_codex_auth; then
-    echo "Autenticazione ChatGPT non trovata ($CODEX_AUTH assente o senza token)." >&2
-    printf "Vuoi fare login adesso (device flow via Codex)? [s/N] "
+    echo "ChatGPT authentication not found ($CODEX_AUTH missing or without a token)." >&2
+    printf "Log in now (device flow via Codex)? [y/N] "
     read -r ANS || ANS=""
-    if [[ "$ANS" =~ ^[sSyY]$ ]]; then
+    if [[ "$ANS" =~ ^[yY]$ ]]; then
       codex_login || exit 1
     fi
     if ! has_codex_auth; then
-      echo "Errore: nessun login completato. Riprova con \`opencc login\` oppure imposta OPENAI_API_KEY." >&2
+      echo "Error: no login completed. Retry with \`opencc login\` or set OPENAI_API_KEY." >&2
       exit 1
     fi
   fi
 
-  # Il contesto è max_context_window × effective_context_window_percent (95%),
-  # cioè la finestra estesa che il backend supporta per il piano.
+  # The context is max_context_window × effective_context_window_percent (95%),
+  # i.e. the extended window the backend supports for the plan.
   if [[ "$MODE" == "subscription" ]] && [[ -f "$CODEX_MODELS_CACHE" ]]; then
     MODELS="$(python3 - "$CODEX_MODELS_CACHE" <<'PY' 2>/dev/null || true
 import json, sys
@@ -331,9 +331,9 @@ DISPLAY_ARR=()
 declare -A CTX=()
 declare -A EFFORTS=()
 declare -A DFLT_EFFORT=()
-# NB: il tab è un separatore IFS "whitespace", quindi `read -r a b c` collasserebbe
-# i tab consecutivi e sposterebbe i campi quando una colonna è vuota (contesto
-# ignoto): le righe vanno divise a mano.
+# NB: the tab is an IFS "whitespace" separator, so `read -r a b c` would collapse
+# consecutive tabs and shift the fields when a column is empty (unknown context):
+# the lines must be split by hand.
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   slug="${line%%$'\t'*}";    line="${line#*$'\t'}"
@@ -349,16 +349,16 @@ while IFS= read -r line; do
 done <<< "$MODELS"
 
 if [[ ${#MODEL_ARR[@]} -eq 0 ]]; then
-  echo "Errore: nessun modello disponibile." >&2
+  echo "Error: no models available." >&2
   exit 1
 fi
 
-# Claude Code filtra dalla discovery automatica tutti gli ID che non contengono
-# `claude` o `anthropic`; i nostri ID reali (`gpt-*`, `minimax-*`, ecc.) non
-# comparirebbero quindi in /model anche con un endpoint /v1/models valido.
-# modelPicker è il meccanismo nativo che accetta ID arbitrari: generiamo opzioni
-# specifiche per il backend corrente e nascondiamo gli alias Anthropic, che con
-# questi gateway sarebbero fuorvianti.
+# Claude Code filters out of automatic discovery every ID that does not
+# contain `claude` or `anthropic`; our real IDs (`gpt-*`, `minimax-*`, etc.)
+# would therefore never show up in /model even with a valid /v1/models
+# endpoint. modelPicker is the native mechanism that accepts arbitrary IDs: we
+# generate options specific to the current backend and hide the Anthropic
+# aliases, which would be misleading with these gateways.
 PICKER_SETTINGS_FILE="$STATE_DIR/model-picker.json"
 EFFORT_POLICY_FILE="$STATE_DIR/model-efforts.json"
 if [[ "$BACKEND" == "go" ]]; then
@@ -413,7 +413,7 @@ atomic_json(picker_output, {
 atomic_json(policy_output, {"models": policies}, ".model-efforts.")
 ' "$PICKER_SETTINGS_FILE" "$EFFORT_POLICY_FILE" "$PICKER_DESCRIPTION"
 
-# --- 4) Default = ultimo usato (se ancora disponibile) ------------------------
+# --- 4) Default = last used (if still available) ------------------------------
 if [[ "$BACKEND" == "go" ]]; then
   DEFAULT="$GO_FALLBACK_MODEL"
   [[ " ${MODEL_ARR[*]} " == *" $DEFAULT "* ]] || DEFAULT="${MODEL_ARR[0]}"
@@ -428,34 +428,34 @@ if [[ -f "$STATE_FILE" ]]; then
   done
 fi
 
-# --- 5) Menu numerato ---------------------------------------------------------
+# --- 5) Numbered menu ---------------------------------------------------------
 if [[ "$BACKEND" == "go" ]]; then
-  echo "Modelli OpenCode Go:"
+  echo "OpenCode Go models:"
 else
-  echo "Modelli OpenAI (auth: $MODE):"
+  echo "OpenAI models (auth: $MODE):"
 fi
 for i in "${!MODEL_ARR[@]}"; do
   tag=""
   ctxstr=""
   [[ -n "${CTX[${MODEL_ARR[$i]}]:-}" ]] && ctxstr="  [$(fmt_ctx "${CTX[${MODEL_ARR[$i]}]}")]"
-  [[ "${MODEL_ARR[$i]}" == "$LAST_USED" ]] && tag="  (ultimo usato)"
+  [[ "${MODEL_ARR[$i]}" == "$LAST_USED" ]] && tag="  (last used)"
   printf "  %2d) %s%s%s\n" "$((i+1))" "${DISPLAY_ARR[$i]}" "$ctxstr" "$tag"
 done
 
 while true; do
-  printf "\nScegli un modello [1-%d] (invio/%s = %s): " "${#MODEL_ARR[@]}" "d" "$DEFAULT"
+  printf "\nChoose a model [1-%d] (enter/%s = %s): " "${#MODEL_ARR[@]}" "d" "$DEFAULT"
   read -r CHOICE || CHOICE=""
   [[ -z "$CHOICE" || "$CHOICE" == "d" ]] && { MODEL="$DEFAULT"; break; }
   if [[ "$CHOICE" =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#MODEL_ARR[@]} )); then
     MODEL="${MODEL_ARR[$((CHOICE-1))]}"
     break
   fi
-  echo "Scelta non valida, riprova."
+  echo "Invalid choice, try again."
 done
 
-# --- 6) Livello di ragionamento (effort) --------------------------------------
-# Sul backend go i modelli `toggle` (ragionamento sempre attivo) non espongono
-# livelli: in quel caso il prompt viene saltato.
+# --- 6) Reasoning level (effort) ----------------------------------------------
+# On the go backend, `toggle` models (always-on reasoning) expose no levels:
+# in that case the prompt is skipped.
 if [[ "$BACKEND" == "go" ]]; then
   VALID_EFFORTS="${EFFORTS[$MODEL]:-}"
 else
@@ -466,33 +466,33 @@ if [[ -n "$VALID_EFFORTS" ]]; then
   EFFORT_DEFAULT=""
   if [[ -f "$STATE_EFFORT_FILE" ]]; then
     EFFORT_DEFAULT="$(<"$STATE_EFFORT_FILE")"
-    # Se il default salvato non è valido per questo modello, riparti da vuoto.
+    # If the saved default is not valid for this model, start from empty.
     [[ ",$VALID_EFFORTS," == *",$EFFORT_DEFAULT,"* ]] || EFFORT_DEFAULT=""
   fi
   DFLT_SHOW="${DFLT_EFFORT[$MODEL]:-}"
-  DEFPROMPT="${EFFORT_DEFAULT:-default del modello${DFLT_SHOW:+ ($DFLT_SHOW)}}"
-  printf "Livello di ragionamento [%s] (invio = %s): " "$VALID_EFFORTS" "$DEFPROMPT"
+  DEFPROMPT="${EFFORT_DEFAULT:-model default${DFLT_SHOW:+ ($DFLT_SHOW)}}"
+  printf "Reasoning level [%s] (enter = %s): " "$VALID_EFFORTS" "$DEFPROMPT"
   read -r EFFORT || EFFORT=""
   [[ -z "$EFFORT" ]] && EFFORT="$EFFORT_DEFAULT"
   if [[ -n "$EFFORT" ]] && ! [[ ",$VALID_EFFORTS," == *",$EFFORT,"* ]]; then
-    echo "Livello non valido ('$EFFORT'); uso il default." >&2
+    echo "Invalid level ('$EFFORT'); using the default." >&2
     EFFORT="$EFFORT_DEFAULT"
   fi
 fi
 
-# Claude Code invia gli effort low..max in output_config.effort. `ultra` non è
-# disponibile in /effort, quindi resta codificato nel modello come @ultra.
+# Claude Code sends efforts low..max in output_config.effort. `ultra` is not
+# available in /effort, so it stays encoded in the model as @ultra.
 if [[ "$EFFORT" == "ultra" ]]; then
   MODEL_EFFORT="${MODEL}@ultra"
 else
   MODEL_EFFORT="$MODEL"
 fi
 
-# --- 7) Salva l'ultimo modello + effort ---------------------------------------
+# --- 7) Save the last model + effort ------------------------------------------
 printf '%s\n' "$MODEL" > "$STATE_FILE"
 printf '%s\n' "$EFFORT" > "$STATE_EFFORT_FILE"
 
-# --- 8) Proxy locale: avvio o riuso se già coerente ----------------------------
+# --- 8) Local proxy: start it, or reuse it if already consistent ---------------
 if [[ "$BACKEND" == "go" ]]; then
   PROXY_MODE="go"
 else
@@ -508,21 +508,21 @@ ensure_proxy() {
     if [[ "$ver" == "$EXPECTED_PROXY_VERSION" && "$mode" == "$PROXY_MODE" ]]; then
       return 0
     fi
-    echo "Errore: sulla porta $PORT è già attivo un proxy opencc incompatibile" >&2
-    echo "        (versione o modalità differente)." >&2
-    echo "        Chiudilo manualmente oppure usa una porta diversa con OPENCC_PROXY_PORT." >&2
+    echo "Error: an incompatible opencc proxy is already listening on port $PORT" >&2
+    echo "        (different version or mode)." >&2
+    echo "        Close it manually or use a different port with OPENCC_PROXY_PORT." >&2
     exit 1
   else
-    # Porta occupata da un processo estraneo?
+    # Port in use by a foreign process?
     if (command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q "[:.]${PORT} ") || \
        (command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1); then
-      echo "Errore: la porta $PORT è occupata da un altro processo." >&2
-      echo "        Imposta OPENCC_PROXY_PORT su una porta libera." >&2
+      echo "Error: port $PORT is in use by another process." >&2
+      echo "        Set OPENCC_PROXY_PORT to a free port." >&2
       exit 1
     fi
   fi
 
-  [[ -f "$PROXY_SCRIPT" ]] || { echo "Errore: $PROXY_SCRIPT non trovato (manca accanto a opencc)." >&2; exit 1; }
+  [[ -f "$PROXY_SCRIPT" ]] || { echo "Error: $PROXY_SCRIPT not found (missing next to opencc)." >&2; exit 1; }
 
   local models_csv
   models_csv="$(IFS=,; printf '%s' "${MODEL_ARR[*]}")"
@@ -544,16 +544,16 @@ ensure_proxy() {
     [[ -n "$health" ]] && return 0
     sleep 0.1
   done
-  echo "Errore: il proxy non si è avviato (log: $STATE_DIR/proxy.log)." >&2
+  echo "Error: the proxy failed to start (log: $STATE_DIR/proxy.log)." >&2
   exit 1
 }
 
-# --- 8b) Registro sessioni: il proxy si chiude con l'ultima sessione -----------
-# Ogni invocazione registra un file in $STATE_DIR/sessions/<pid>.sess con la
-# coppia porta|modalità del proxy che usa. All'uscita da claude il file viene
-# rimosso; se non resta nessuna sessione sullo stesso proxy, il proxy viene
-# fermato. I file di sessioni terminate in modo anomalo (PID non più vivo)
-# vengono spazzati all'avvio successivo.
+# --- 8b) Session registry: the proxy closes with the last session --------------
+# Every invocation registers a file in $STATE_DIR/sessions/<pid>.sess with the
+# port|mode pair of the proxy it uses. On exit from claude the file is removed;
+# if no session remains on the same proxy, the proxy is stopped. Files left
+# behind by abnormally terminated sessions (dead PID) are swept at the next
+# startup.
 SESSION_DIR="$STATE_DIR/sessions"
 mkdir -p "$SESSION_DIR"
 
@@ -588,19 +588,19 @@ stop_proxy_if_last() {
       if [[ "$ver" == "$EXPECTED_PROXY_VERSION" && "$mode" == "$PROXY_MODE" ]]; then
         kill "$(<"$STATE_DIR/proxy.pid")" 2>/dev/null || true
         rm -f "$STATE_DIR/proxy.pid"
-        echo "Proxy opencc fermato (ultima sessione chiusa)." >&2
+        echo "opencc proxy stopped (last session closed)." >&2
       fi
     fi
   fi
 }
 
-# Registrazione anticipata (prima di ensure_proxy): se un'altra sessione termina
-# mentre questa sta ancora avviandosi, il proxy non viene chiuso sotto i piedi.
+# Early registration (before ensure_proxy): if another session exits while this
+# one is still starting up, the proxy is not yanked away from under it.
 sweep_stale_sessions
 printf '%s\n' "$PORT|$PROXY_MODE" > "$SESSION_DIR/$$.sess"
 trap stop_proxy_if_last EXIT
 
-# --- 9) Export e avvio --------------------------------------------------------
+# --- 9) Exports and launch ----------------------------------------------------
 unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_IDENTITY_TOKEN
 EXTRA=()
 
@@ -609,23 +609,24 @@ export ANTHROPIC_BASE_URL="$PROXY_BASE_URL"
 if [[ "$BACKEND" == "openai" && "$MODE" == "apikey" ]]; then
   export ANTHROPIC_API_KEY="$OPENAI_API_KEY"
 else
-  # Il proxy gestisce l'autenticazione upstream; un valore locale non vuoto
-  # basta a disattivare il login OAuth di Claude Code.
+  # The proxy handles upstream auth; any non-empty local value is enough to
+  # disable Claude Code's OAuth login.
   export ANTHROPIC_API_KEY="opencc-$PROXY_MODE"
 fi
 unset ANTHROPIC_CUSTOM_HEADERS
 export ANTHROPIC_DEFAULT_MODEL="$MODEL_EFFORT"
 export ANTHROPIC_MODEL="$MODEL_EFFORT"
 
-# Il modello viene proposto come default della sessione; le opzioni generate in
-# model-picker.json permettono poi a `/model` di cambiarlo a runtime.
+# The model is proposed as the session default; the options generated in
+# model-picker.json then let `/model` change it at runtime.
 unset CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
 
-# L'effort va passato con --effort, che imposta il livello *della sessione*: resta
-# modificabile con /effort. La variabile CLAUDE_CODE_EFFORT_LEVEL lo inchioderebbe
-# invece per tutto il processo, rendendo /effort inefficace: va anzi disattivata se
-# ereditata dall'ambiente. `ultra` non e' accettato da --effort (viene ignorato in
-# silenzio): resta codificato nel modello come @ultra.
+# The effort must be passed with --effort, which sets the level *of the
+# session*: it stays changeable with /effort. The CLAUDE_CODE_EFFORT_LEVEL
+# variable would instead pin it for the whole process, making /effort
+# ineffective: it must even be unset if inherited from the environment. `ultra`
+# is not accepted by --effort (it would be silently ignored): it stays encoded
+# in the model as @ultra.
 unset CLAUDE_CODE_EFFORT_LEVEL
 if [[ -n "$EFFORT" && "$EFFORT" != "ultra" ]] && [[ "$*" != *"--effort"* ]]; then
   EXTRA=(--effort "$EFFORT")
@@ -633,10 +634,10 @@ fi
 
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_EFFORT"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_EFFORT"
-# L'alias haiku alimenta il classificatore dell'auto-mode e le attività di
-# background. Il classificatore usa max_tokens=1: i modelli con ragionamento
-# consumano quel token nel thinking e non producono testo, quindi l'auto mode
-# fallisce. Pinniamo l'alias su un modello piccolo SENZA ragionamento.
+# The haiku alias feeds the auto-mode classifier and the background tasks.
+# The classifier uses max_tokens=1: reasoning models spend that token on
+# thinking and produce no text, so auto mode fails. We pin the alias to a
+# small model WITHOUT reasoning.
 if [[ "$BACKEND" == "go" ]]; then
   CLASSIFIER_MODEL="minimax-m3"
   for m in "${MODEL_ARR[@]}"; do
@@ -658,17 +659,17 @@ fi
 CTXSTR=""
 [[ -n "${CTX[$MODEL]:-}" ]] && CTXSTR=", contesto: $(fmt_ctx "${CTX[$MODEL]}")"
 EFFSTR=""
-[[ -n "$EFFORT" ]] && EFFSTR=", ragionamento: $EFFORT"
+[[ -n "$EFFORT" ]] && EFFSTR=", reasoning: $EFFORT"
 if [[ "$BACKEND" == "go" ]]; then
-  echo "Avvio Claude Code con modello: $MODEL (backend: go$CTXSTR$EFFSTR)"
+  echo "Starting Claude Code with model: $MODEL (backend: go$CTXSTR$EFFSTR)"
 else
-  echo "Avvio Claude Code con modello: $MODEL (backend: openai/$MODE$CTXSTR$EFFSTR)"
+  echo "Starting Claude Code with model: $MODEL (backend: openai/$MODE$CTXSTR$EFFSTR)"
 fi
-echo "Durante la sessione: /model cambia il modello, /effort cambia il ragionamento."
+echo "During the session: /model changes the model, /effort changes the reasoning."
 
-# La registrazione è avvenuta nella sezione 8 (prima di ensure_proxy), così una
-# sessione che termina mentre un'altra si sta avviando non chiude il proxy.
-# set +e: claude può uscire con un codice non zero; lo propaghiamo noi.
+# The registration happened in section 8 (before ensure_proxy), so a session
+# that exits while another one is starting up does not close the proxy.
+# set +e: claude may exit with a non-zero code; we propagate it ourselves.
 set +e
 claude --settings "$PICKER_SETTINGS_FILE" "${EXTRA[@]}" "$@"
 status=$?

@@ -1,269 +1,275 @@
 # opencc
 
-Wrapper bash per avviare **Claude Code** su backend alternativi. Unifica i due
-script precedenti (`cc-go` e `opencc`) in un unico tool con tre backend:
+Bash wrapper for running **Claude Code** against alternative backends. Unifies
+the two previous scripts (`cc-go` and `opencc`) into a single tool with three
+backends:
 
-| Backend     | Cosa usa | Autenticazione | Proxy |
-|-------------|----------|----------------|-------|
-| `openai`    | modelli OpenAI (GPT-5.x) | abbonamento ChatGPT (OAuth Codex) o `OPENAI_API_KEY` | sì (`opencc-proxy.mjs`, traduzione Anthropic→Responses) |
-| `go`        | gateway [opencode-go](https://opencode.ai/zen/go) di OpenCode | header `x-api-key` | sì (pass-through Anthropic) |
-| `anthropic` | Claude Code standard | invariata (comportamento nativo) | no |
+| Backend     | What it uses | Authentication | Proxy |
+|-------------|--------------|----------------|-------|
+| `openai`    | OpenAI models (GPT-5.x) | ChatGPT subscription (Codex OAuth) or `OPENAI_API_KEY` | yes (`opencc-proxy.mjs`, Anthropic→Responses translation) |
+| `go`        | the [opencode-go](https://opencode.ai/zen/go) gateway from OpenCode | `x-api-key` header | yes (Anthropic pass-through) |
+| `anthropic` | stock Claude Code | unchanged (native behavior) | no |
 
-Nei backend `openai` e `go`: menu numerato dei modelli con la dimensione del
-contesto, scelta del **livello di ragionamento**, memoria dell'ultima scelta
-(per backend) e configurazione automatica delle variabili d'ambiente di Claude
-Code. Il backend `anthropic` è un pass-through puro: lancia `claude` senza
-toccare endpoint, autenticazione, modello, effort o settings.
+On the `openai` and `go` backends: numbered model menu with context size,
+**reasoning level** selection, memory of the last choice (per backend) and
+automatic configuration of Claude Code's environment variables. The
+`anthropic` backend is a pure pass-through: it launches `claude` without
+touching endpoint, authentication, model, effort or settings.
 
-## Installazione
+## Installation
 
-Dalla directory del repository:
+From the repository directory:
 
 ```bash
 ./install.sh
 ```
 
-Lo script verifica che **Claude Code** (`claude`) sia installato — se manca,
-propone di installarlo (installer ufficiale via `curl`, fallback `npm`) — e solo
-poi copia `opencc` e `opencc-proxy.mjs` in `~/.opencc/`, collegandoli a
-`~/.local/bin/` con due symlink:
+The script checks that **Claude Code** (`claude`) is installed — if it is
+missing, it offers to install it (official installer via `curl`, `npm` as a
+fallback) — and only then copies `opencc` and `opencc-proxy.mjs` into
+`~/.opencc/`, linking them into `~/.local/bin/` with two symlinks:
 
 ```bash
 ~/.local/bin/opencc            -> ~/.opencc/opencc
 ~/.local/bin/opencc-proxy.mjs  -> ~/.opencc/opencc-proxy.mjs
 ```
 
-Rilanciare `install.sh` dopo un aggiornamento aggiorna i file in `~/.opencc`
-senza toccare i symlink. I due file devono restare affiancati: `opencc` cerca
-`opencc-proxy.mjs` nella propria directory (serve ai backend `openai` e `go`).
+Re-running `install.sh` after an update refreshes the files in `~/.opencc`
+without touching the symlinks. The two files must stay side by side: `opencc`
+looks for `opencc-proxy.mjs` in its own directory (required by the `openai`
+and `go` backends).
 
-### Installazione manuale
+### Manual installation
 
-Copiare `opencc` **e** `opencc-proxy.mjs` nella stessa directory del `PATH`
-(es. `~/.local/bin/`) e rendere eseguibile `opencc`:
+Copy `opencc` **and** `opencc-proxy.mjs` into the same directory on your
+`PATH` (e.g. `~/.local/bin/`) and make `opencc` executable:
 
 ```bash
 cp opencc opencc-proxy.mjs ~/.local/bin/
 chmod +x ~/.local/bin/opencc
 ```
 
-## Prerequisiti
+## Prerequisites
 
-- `claude` installato (Claude Code)
-- `curl` e `python3` (elenco modelli; niente `jq`) — non servono per il backend
-  `anthropic`, che ha zero dipendenze oltre a `claude`
-- backend `openai`/`go`: `node` ≥ 18 per il proxy
-- backend `openai`:
-  - **subscription (predefinita):** il [CLI Codex](https://github.com/openai/codex)
-    per il login. Il token OAuth sta in `~/.codex/auth.json` (scritto da
-    `opencc login`); la lista modelli è letta da `~/.codex/models_cache.json`.
-  - **apikey:** una chiave in `OPENAI_API_KEY`.
-- backend `go`: una API key in `OPENCODE_API_KEY` oppure il file
-  `~/.local/share/opencode/auth.json` (login con `opencode`).
+- `claude` installed (Claude Code)
+- `curl` and `python3` (model listing; no `jq` needed) — not required for the
+  `anthropic` backend, which has zero dependencies beyond `claude`
+- `openai`/`go` backends: `node` ≥ 18 for the proxy
+- `openai` backend:
+  - **subscription (default):** the [Codex CLI](https://github.com/openai/codex)
+    for login. The OAuth token lives in `~/.codex/auth.json` (written by
+    `opencc login`); the model list is read from `~/.codex/models_cache.json`.
+  - **apikey:** a key in `OPENAI_API_KEY`.
+- `go` backend: an API key in `OPENCODE_API_KEY` or the file
+  `~/.local/share/opencode/auth.json` (login with `opencode`).
 
-## Utilizzo
+## Usage
 
 ```bash
-opencc login                  # genera/rinnova ~/.codex/auth.json (device flow)
-opencc [argomenti per claude] # menu backend + modelli + ragionamento, poi avvia
+opencc login                  # generates/refreshes ~/.codex/auth.json (device flow)
+opencc [args for claude]      # backend + model + reasoning menu, then launches
 ```
 
-All'avvio `opencc` chiede:
+At startup `opencc` asks for:
 
-1. il **backend**:
-   - `1` `openai` — modelli OpenAI (proxy locale);
-   - `2` `go` — gateway OpenCode Go;
-   - `0` `anthropic` — Claude Code standard (pass-through, nessuna modifica).
+1. the **backend**:
+   - `1` `openai` — OpenAI models (local proxy);
+   - `2` `go` — OpenCode Go gateway;
+   - `0` `anthropic` — stock Claude Code (pass-through, no changes).
 
-   Il default è l'ultimo usato; il menu si salta impostando
+   The default is the last one used; the menu can be skipped by setting
    `OPENCC_BACKEND=openai|go|anthropic`.
-2. il **modello**, con contesto e segno dell'ultimo usato;
-3. il **livello di ragionamento** valido per quel modello.
+2. the **model**, with context size and a marker for the last one used;
+3. the **reasoning level** valid for that model.
 
-Premendo invio (o `d`) si usano i default. Sul backend `go` i modelli con
-ragionamento sempre attivo (es. `minimax-m3`) non mostrano il punto 3.
+Press enter (or `d`) to accept the defaults. On the `go` backend, models with
+always-on reasoning (e.g. `minimax-m3`) skip step 3.
 
-## Cambiare modello e ragionamento durante la sessione
+## Changing model and reasoning mid-session
 
-Le scelte fatte al lancio sono solo i **default della sessione**: `/model` e
-`/effort` restano attivi e valgono per le richieste successive, senza riavviare.
-`opencc` genera per il backend corrente un file `model-picker.json` e lo carica
-tramite `--settings`: `/model` mostra così i modelli OpenAI o OpenCode Go invece
-degli alias Anthropic standard. Ogni voce include, nella descrizione, gli
-**effort realmente supportati** dal modello e il suo default (es.
+The choices made at launch are only the session **defaults**: `/model` and
+`/effort` remain active and apply to subsequent requests without a restart.
+`opencc` generates a `model-picker.json` for the current backend and loads it
+via `--settings`, so `/model` shows the OpenAI or OpenCode Go models instead of
+the stock Anthropic aliases. Every entry lists, in its description, the
+**efforts the model actually supports** and its default (e.g.
 `OpenAI via opencc · effort: low, medium, high, xhigh, max (default: medium)`);
-i modelli senza ragionamento configurabile sono marcati `effort: non
-configurabile`.
+models without configurable reasoning are marked `effort: not configurable`.
 
-La discovery automatica di Claude Code non viene usata: anche se il backend
-espone correttamente `GET /v1/models`, Claude Code scarta per design tutti gli ID
-che non contengono `claude` o `anthropic` (quindi `gpt-*`, `minimax-*`, ecc.). Il
-`modelPicker` nativo accetta invece ID arbitrari e li inoltra senza rinominarli.
+Claude Code's automatic model discovery is not used: even if the backend
+exposes a valid `GET /v1/models`, Claude Code drops by design every ID that
+does not contain `claude` or `anthropic` (so `gpt-*`, `minimax-*`, etc.). The
+native `modelPicker` accepts arbitrary IDs instead and forwards them without
+renaming.
 
-### Limite: il picker `/effort` è globale
+### Limitation: the `/effort` picker is global
 
-Claude Code non conosce le capability dei modelli custom, e **non** consente di
-filtrare dinamicamente i livelli di `/effort` per il modello selezionato: le righe
-di `modelPicker` accettano solo ID, etichetta e descrizione, e non esiste un modo
-per dichiarare gli effort supportati o un default per ID arbitrari. Il picker
-`/effort` resta quindi globale.
+Claude Code has no knowledge of custom-model capabilities and does **not**
+allow filtering `/effort` levels per selected model: `modelPicker` entries only
+accept an ID, a label and a description, and there is no way to declare
+supported efforts or a default for arbitrary IDs. The `/effort` picker stays
+global.
 
-La correzione avviene nel proxy, che riceve ogni richiesta con il modello e
-l'effort scelto e applica la **policy reale** del modello (da
+The fix happens in the proxy, which receives every request with the chosen
+model and effort and applies the model's **real policy** (from
 `model-efforts.json`):
 
-- livello non supportato → **ridotto** al massimo livello disponibile non
-  superiore a quello richiesto (es. `xhigh` → `high` su un modello senza
-  `xhigh`); se nessun livello è minore, al minimo disponibile;
-- livello sconosciuto → default del modello;
-- modello senza effort → l'effort viene **rimosso**;
-- nessun effort scelto → **default** del modello.
+- unsupported level → **clamped down** to the highest available level not
+  exceeding the requested one (e.g. `xhigh` → `high` on a model without
+  `xhigh`); if none is lower, to the lowest available one;
+- unknown level → the model's default;
+- model without effort → the effort is **removed**;
+- no effort chosen → the model's **default**.
 
-Quando il proxy modifica l'effort, scrive una riga nel proprio log
-(`~/.local/state/opencc/<backend>/proxy.log`), es.:
+When the proxy changes the effort, it logs a line in its own log
+(`~/.local/state/opencc/<backend>/proxy.log`), e.g.:
 `[opencc] effort gpt-two: max -> high (clamped)`.
 
-Altri limiti noti:
+Other known limitations:
 
-- **`ultra`** (solo GPT-5.6) non è un livello che `/effort` accetta: si può
-  scegliere solo dal menu iniziale, dove viene codificato come `modello@ultra`.
-- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` viene impostato in base al modello scelto al
-  lancio e non segue i cambi fatti con `/model`.
+- **`ultra`** (GPT-5.6 only) is not a level `/effort` accepts: it can only be
+  chosen from the initial menu, where it is encoded as `model@ultra`.
+- `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set from the model chosen at launch and
+  does not follow `/model` changes.
 
-> **Nota:** l'effort viene passato con il flag `--effort` e **non** con la
-> variabile `CLAUDE_CODE_EFFORT_LEVEL`: quella variabile inchioda il livello per
-> l'intero processo e rende `/effort` inefficace (Claude Code continuerebbe a
-> inviare il valore dell'env). Se è presente nell'ambiente, `opencc` la rimuove.
+> **Note:** the effort is passed with the `--effort` flag and **not** with the
+> `CLAUDE_CODE_EFFORT_LEVEL` variable: that variable pins the level for the
+> whole process and makes `/effort` ineffective (Claude Code would keep
+> sending the env value). If present in the environment, `opencc` removes it.
 
-### Variabili d'ambiente
+### Environment variables
 
-| Variabile | Effetto |
-|-----------|---------|
-| `OPENCC_BACKEND` | `openai` \| `go` \| `anthropic` — salta il menu backend |
-| `OPENCC_MODE` | `subscription` \| `apikey` — forza l'autenticazione OpenAI |
-| `OPENCC_PROXY_PORT` | porta del proxy locale (default `3199`, backend `openai`/`go`) |
-| `OPENAI_API_KEY` | chiave OpenAI (modalità `apikey`) |
-| `OPENCODE_API_KEY` | chiave del gateway OpenCode Go |
+| Variable | Effect |
+|----------|--------|
+| `OPENCC_BACKEND` | `openai` \| `go` \| `anthropic` — skips the backend menu |
+| `OPENCC_MODE` | `subscription` \| `apikey` — forces OpenAI authentication |
+| `OPENCC_PROXY_PORT` | local proxy port (default `3199`, `openai`/`go` backends) |
+| `OPENAI_API_KEY` | OpenAI key (`apikey` mode) |
+| `OPENCODE_API_KEY` | OpenCode Go gateway key |
 
-## Backend `openai`
+## `openai` backend
 
-Claude Code parla **solo** il protocollo Anthropic (`/v1/messages`), mentre i
-backend OpenAI usano il protocollo Responses: `opencc-proxy.mjs` è un proxy
-locale (solo `127.0.0.1`) che traduce le richieste e le inoltra a
+Claude Code speaks **only** the Anthropic protocol (`/v1/messages`), while the
+OpenAI backends speak the Responses protocol: `opencc-proxy.mjs` is a local
+proxy (bound to `127.0.0.1` only) that translates the requests and forwards
+them to
 
-- **subscription** → `https://chatgpt.com/backend-api/codex/responses`, col token
-  OAuth di `~/.codex/auth.json` (usa il piano ChatGPT Plus/Pro/Team);
-- **apikey** → `https://api.openai.com/v1/responses`, con `OPENAI_API_KEY`.
+- **subscription** → `https://chatgpt.com/backend-api/codex/responses`, with
+  the OAuth token from `~/.codex/auth.json` (uses your ChatGPT
+  Plus/Pro/Team plan);
+- **apikey** → `https://api.openai.com/v1/responses`, with `OPENAI_API_KEY`.
 
-- **Login:** `opencc login` avvia il device flow del CLI Codex. Se manca
-  l'autenticazione, `opencc` la propone all'avvio.
-- **Refresh automatico:** i token durano ~24h; su 401 il proxy li rinnova via
-  `refresh_token` e riscrive `~/.codex/auth.json`. Se il refresh fallisce, basta
-  rifare `opencc login`.
-- **Modelli:** da `~/.codex/models_cache.json` (subscription) o da `/v1/models`
-  di OpenAI (apikey); fallback su una lista statica. Il proxy li espone anche a
-  Claude Code, ma la discovery automatica non viene usata (vedi sopra).
-- **Contesto:** `max_context_window × effective_context_window_percent` (es.
-  ~828K per GPT-5.6), esportato in `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
-- **Ragionamento:** Claude Code invia `output_config: { effort }` e il proxy lo
-  traduce in `reasoning: { effort }`, normalizzandolo con la policy del modello
-  (vedi sopra). `ultra` non è accettato da `--effort`/`/effort` (verrebbe
-  ignorato in silenzio), quindi resta codificato nel modello come
-  `modello@ultra`, formato che il proxy riconosce.
-- **Collegamento tra turni (risparmio input):** il proxy non rimanda mai
-  l'intera storia, come fa codex: se la nuova richiesta della stessa sessione è
-  un'estensione della precedente, invia **solo il delta** con
-  `previous_response_id`; il backend ricollega il contesto e fattura la parte
-  ripetuta a tariffa cache. Se il collegamento fallisce (risposta scaduta,
-  contesto cambiato), il proxy ritenta automaticamente con la richiesta completa.
-  Il log registra ogni richiesta:
-  `[opencc] delta sess-1|: 1 item inviati (baseline 2)` e
+- **Login:** `opencc login` starts the Codex CLI device flow. If
+  authentication is missing, `opencc` offers it at startup.
+- **Automatic refresh:** tokens last ~24h; on 401 the proxy refreshes them via
+  `refresh_token` and rewrites `~/.codex/auth.json`. If the refresh fails,
+  just run `opencc login` again.
+- **Models:** from `~/.codex/models_cache.json` (subscription) or from
+  OpenAI's `/v1/models` (apikey); falls back to a static list. The proxy also
+  exposes them to Claude Code, but automatic discovery is not used (see
+  above).
+- **Context:** `max_context_window × effective_context_window_percent` (e.g.
+  ~828K for GPT-5.6), exported as `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.
+- **Reasoning:** Claude Code sends `output_config: { effort }` and the proxy
+  translates it into `reasoning: { effort }`, normalizing it against the
+  model's policy (see above). `ultra` is not accepted by `--effort`/`/effort`
+  (it would be silently ignored), so it stays encoded in the model as
+  `model@ultra`, a format the proxy recognizes.
+- **Turn chaining (input savings):** the proxy never resends the full history
+  like codex does: if the new request of the same session is an extension of
+  the previous one, it sends **only the delta** with `previous_response_id`;
+  the backend reconnects the context and bills the repeated part at cache
+  rates. If chaining fails (expired response, changed context), the proxy
+  automatically retries with the full request. The log records every request:
+  `[opencc] delta sess-1|: 1 items sent (baseline 2)` and
   `[opencc] usage gpt-5.6-sol: in=... cached=... out=... (delta|full)`.
-  Prima di questo fix, ogni turno rimandava la storia completa via HTTP: se la
-  cache automatica (TTL ~5 min) scadeva, l'intero contesto veniva rifatturato a
-  prezzo pieno — da qui un consumo molto più alto di codex/opencode.
-- **`/usage`:** i token (input/output) mostrati da `/usage` sono quelli reali del
-  backend OpenAI: il proxy converte `input_tokens_details.cached_tokens` in
-  `cache_read_input_tokens` e lo sottrae da `input_tokens`, come da convenzione
-  Anthropic. Due limiti: le colonne **cache read/write** risultano 0 (la
-  Responses API riporta l'usage solo a fine stream, mentre Claude Code legge la
-  cache da `message_start`), e il **costo** è una stima di Claude Code per modelli
-  sconosciuti, marcata `costs may be inaccurate due to usage of unknown models`
-  — non è possibile iniettare la prezzatura del provider.
+  Before this fix, every turn resubmitted the full history over HTTP: when the
+  automatic cache (TTL ~5 min) expired, the whole context was re-billed at
+  full price — hence a much higher consumption than codex/opencode.
+- **`/usage`:** the tokens (input/output) shown by `/usage` are the real ones
+  from the OpenAI backend: the proxy converts
+  `input_tokens_details.cached_tokens` into `cache_read_input_tokens` and
+  subtracts it from `input_tokens`, per Anthropic convention. Two limits: the
+  **cache read/write** columns show 0 (the Responses API only reports usage at
+  the end of the stream, while Claude Code reads the cache from
+  `message_start`), and the **cost** is a Claude Code estimate for unknown
+  models, marked `costs may be inaccurate due to usage of unknown models` —
+  it is not possible to inject provider pricing.
 
-## Backend `go`
+## `go` backend
 
-- **Modelli:** elenco da `/v1/models` del gateway; **contesto ed effort** dal
-  catalogo upstream `https://models.opencode.ai/api.json` (provider
-  `opencode-go`). Cache in `~/.local/state/opencc/go/models.tsv`, rinfrescata in
-  background dopo 7 giorni; senza cache si usa il fallback `minimax-m3`.
-- **Ragionamento:** i valori validi del modello vengono intersecati con quelli
-  accettati da Claude Code (`low,medium,high,xhigh,max`).
-- **`/usage`:** essendo un pass-through Anthropic, l'usage del gateway arriva a
-  Claude Code senza conversioni: token e cache sono quelli riportati da
-  opencode-go (se li include); il costo resta una stima per modelli sconosciuti.
-- **Proxy pass-through:** `opencc` instrada il backend `go` attraverso lo stesso
-  proxy locale, in modalità **pass-through Anthropic**: il proxy modifica solo
-  `model` ed `output_config.effort` (applicando la policy) e inoltra al gateway
-  il resto della richiesta e della risposta senza tradurle. Il proxy chiede
-  `Accept-Encoding: identity` all'upstream e non inoltra `Content-Encoding`:
-  evita così che il body già decompresso venga re-decompresso da Claude Code
-  (BrotliDecompressionError). Il proxy autentica con `OPENCODE_API_KEY` (o il
-  valore da `auth.json`) in `x-api-key`.
+- **Models:** list from the gateway's `/v1/models`; **context and effort**
+  from the upstream catalog `https://models.opencode.ai/api.json` (provider
+  `opencode-go`). Cached in `~/.local/state/opencc/go/models.tsv`, refreshed
+  in the background after 7 days; without a cache the `minimax-m3` fallback
+  is used.
+- **Reasoning:** the model's valid levels are intersected with those accepted
+  by Claude Code (`low,medium,high,xhigh,max`).
+- **`/usage`:** being an Anthropic pass-through, the gateway's usage reaches
+  Claude Code without conversions: tokens and cache are what opencode-go
+  reports (if it includes them); the cost remains an estimate for unknown
+  models.
+- **Proxy pass-through:** `opencc` routes the `go` backend through the same
+  local proxy, in **Anthropic pass-through** mode: the proxy only modifies
+  `model` and `output_config.effort` (applying the policy) and forwards the
+  rest of the request and response untranslated. The proxy asks the upstream
+  for `Accept-Encoding: identity` and does not forward `Content-Encoding`:
+  this prevents the already-decompressed body from being decompressed again
+  by Claude Code (BrotliDecompressionError). The proxy authenticates with
+  `OPENCODE_API_KEY` (or the value from `auth.json`) in `x-api-key`.
 
-## Auto mode (classificatore)
+## Auto mode (classifier)
 
-L'auto mode di Claude Code usa il classificatore di sicurezza tramite l'alias
-**haiku** con `max_tokens: 1`. I modelli con ragionamento consumano quel singolo
-token nel `thinking` e non producono testo: il classificatore fallisce e l'auto
-mode riporta *"auto mode cannot determine the safety"*. Per questo `opencc`
-pinnà `ANTHROPIC_DEFAULT_HAIKU_MODEL` su un modello dedicato **senza
-ragionamento**:
+Claude Code's auto mode uses the safety classifier through the **haiku**
+alias with `max_tokens: 1`. Reasoning models spend that single token on
+`thinking` and produce no text: the classifier fails and auto mode reports
+*"auto mode cannot determine the safety"*. That is why `opencc` pins
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` to a dedicated model **without reasoning**:
 
-- backend `go` → il primo modello del catalogo senza livelli di effort
-  (default `minimax-m3`);
-- backend `openai` → il primo modello `*mini*` (default `gpt-5.4-mini`).
+- `go` backend → the first catalog model with no effort levels (default
+  `minimax-m3`);
+- `openai` backend → the first `*mini*` model (default `gpt-5.4-mini`).
 
-Il modello principale (opus/sonnet, subagent) non cambia. Il backend
-`anthropic` usa il comportamento nativo.
+The main model (opus/sonnet, subagents) is unchanged. The `anthropic` backend
+uses native behavior.
 
-## Chiusura automatica del proxy
+## Automatic proxy shutdown
 
-Quando esci da Claude Code, `opencc` chiude il proxy **se non restano altre
-sessioni attive** sullo stesso proxy (porta+modalità). Ogni invocazione registra
-un file in `~/.local/state/opencc/<backend>/sessions/<pid>.sess`; all'uscita il
-file viene rimosso e, se era l'ultimo, il proxy viene terminato. I file di
-sessioni terminate in modo anomalo (PID non più vivo) vengono spazzati
-all'avvio successivo. Il backend `anthropic` non usa il proxy: nessuna
-registrazione.
+When you exit Claude Code, `opencc` stops the proxy **if no other sessions
+remain active** on the same proxy (port+mode). Every invocation registers a
+file in `~/.local/state/opencc/<backend>/sessions/<pid>.sess`; on exit the
+file is removed and, if it was the last one, the proxy is terminated. Session
+files left behind by abnormally terminated sessions (dead PID) are swept at
+the next startup. The `anthropic` backend does not use the proxy: no
+registration.
 
-## Backend `anthropic`
+## `anthropic` backend
 
-Selezionando `anthropic` `opencc` esegue `claude` senza alcuna modifica:
-nessun proxy, nessuna variabile d'ambiente di gateway, nessun menu modelli e
-nessun `--settings` generato. Il comportamento è quello nativo di Claude Code,
-con l'eventuale configurazione del tuo ambiente. È l'unico backend senza
-dipendenza da `node`/`curl`/`python3`.
+Selecting `anthropic` makes `opencc` run `claude` with no changes at all: no
+proxy, no gateway environment variables, no model menu and no generated
+`--settings`. Behavior is stock Claude Code, with whatever configuration your
+environment has. It is the only backend without a `node`/`curl`/`python3`
+dependency.
 
-## Stato locale
+## Local state
 
 `~/.local/state/opencc/`:
 
 ```
-last-backend         ultimo backend usato
+last-backend         last backend used
 openai/              last-model, last-effort, model-picker.json,
                      model-efforts.json, proxy.log, proxy.pid
 go/                  last-model, last-effort, model-picker.json,
                      model-efforts.json, models.tsv, models.ids
 ```
 
-Lo stato dei vecchi script viene migrato automaticamente al primo avvio
+State from the old scripts is migrated automatically on first run
 (`~/.local/state/opencc/*` → `openai/`, `~/.local/state/cc-go/*` → `go/`).
 
-## Note
+## Notes
 
-- **Piano gratis:** il backend subscription richiede un piano a pagamento
-  ChatGPT (Plus/Pro/Team).
-- La logica di traduzione di `opencc-proxy.mjs` è adattata dal proxy MIT-licensed
-  di [codex-for-claude-code](https://github.com/Yusang-park/codex-for-claude-code).
-- Test del proxy: `node --test opencc-proxy.test.mjs`.
+- **Free plan:** the subscription backend requires a paid ChatGPT plan
+  (Plus/Pro/Team).
+- The translation logic in `opencc-proxy.mjs` is adapted from the MIT-licensed
+  proxy of [codex-for-claude-code](https://github.com/Yusang-park/codex-for-claude-code).
+- Proxy tests: `node --test opencc-proxy.test.mjs`.

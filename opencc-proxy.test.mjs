@@ -23,10 +23,10 @@ process.on('exit', () => rmSync(policyDir, { recursive: true, force: true }));
 
 const { buildResponsesAPIRequest, createServer, normalizeEffort, extractUsage, isExtension, normalizeArguments } = await import('./opencc-proxy.mjs');
 
-test('traduce output_config.effort nel formato Responses', () => {
+test('translates output_config.effort into the Responses format', () => {
   const req = buildResponsesAPIRequest({
     model: 'gpt-one',
-    messages: [{ role: 'user', content: 'ciao' }],
+    messages: [{ role: 'user', content: 'hello' }],
     output_config: { effort: 'xhigh' },
   }, null);
 
@@ -34,7 +34,7 @@ test('traduce output_config.effort nel formato Responses', () => {
   assert.deepEqual(req.reasoning, { effort: 'xhigh' });
 });
 
-test('il suffisso @effort ha precedenza per compatibilità', () => {
+test('the @effort suffix takes precedence for compatibility', () => {
   const req = buildResponsesAPIRequest({
     model: 'gpt-one',
     messages: [],
@@ -44,7 +44,7 @@ test('il suffisso @effort ha precedenza per compatibilità', () => {
   assert.deepEqual(req.reasoning, { effort: 'max' });
 });
 
-test('normalizza l’effort in base alle capability reali del modello', () => {
+test("normalizes the effort against the model's real capabilities", () => {
   const sparse = { supported: ['low', 'high', 'max'], default: 'high' };
   assert.deepEqual(normalizeEffort('gpt-one', 'high', sparse), {
     requested: 'high', applied: 'high', reason: 'exact',
@@ -60,22 +60,22 @@ test('normalizza l’effort in base alle capability reali del modello', () => {
   });
 });
 
-test('riconosce l’estensione della conversazione per il collegamento turni', () => {
-  const base = [{ role: 'user', content: 'ciao' }];
+test('recognizes a conversation extension for turn chaining', () => {
+  const base = [{ role: 'user', content: 'hello' }];
   const full = [
-    { role: 'user', content: 'ciao' },
+    { role: 'user', content: 'hello' },
     { role: 'assistant', content: 'ok' },
-    { role: 'user', content: 'e poi?' },
+    { role: 'user', content: 'and then?' },
   ];
   assert.equal(isExtension(base, full), true);
   assert.equal(isExtension(base, base), true);
   assert.equal(isExtension(full, base), false);
-  assert.equal(isExtension([{ role: 'user', content: 'diverso' }], full), false);
+  assert.equal(isExtension([{ role: 'user', content: 'different' }], full), false);
   assert.equal(normalizeArguments('{"a":1,"b":[2]}'), '{"a":1,"b":[2]}');
   assert.equal(normalizeArguments('non-json'), '{}');
 });
 
-test('converte l’usage Responses nel formato Anthropic per /usage', () => {
+test('converts the Responses usage into the Anthropic format for /usage', () => {
   assert.deepEqual(extractUsage({
     input_tokens: 120,
     output_tokens: 40,
@@ -95,13 +95,13 @@ test('converte l’usage Responses nel formato Anthropic per /usage', () => {
   });
 });
 
-test('rimuove l’effort per un modello che non lo espone', () => {
+test('removes the effort for a model that does not expose it', () => {
   assert.deepEqual(normalizeEffort('gpt-one', 'max', { supported: [], default: null }), {
     requested: 'max', applied: null, reason: 'unsupported-model',
   });
 });
 
-test('espone i modelli e applica la policy all’effort scelto in sessione', async (t) => {
+test('exposes the models and applies the policy to the effort chosen in-session', async (t) => {
   const upstreamBodies = [];
   const fetchImpl = async (_url, options) => {
     upstreamBodies.push(JSON.parse(options.body));
@@ -125,7 +125,7 @@ test('espone i modelli e applica la policy all’effort scelto in sessione', asy
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'gpt-two',
-      messages: [{ role: 'user', content: 'ciao' }],
+      messages: [{ role: 'user', content: 'hello' }],
       output_config: { effort: 'medium' },
       stream: false,
     }),
@@ -140,7 +140,7 @@ test('espone i modelli e applica la policy all’effort scelto in sessione', asy
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'gpt-one',
-      messages: [{ role: 'user', content: 'ciao' }],
+      messages: [{ role: 'user', content: 'hello' }],
       output_config: { effort: 'max' },
       stream: false,
     }),
@@ -150,7 +150,7 @@ test('espone i modelli e applica la policy all’effort scelto in sessione', asy
   assert.equal(upstreamBodies[1].reasoning, undefined);
 });
 
-test('pass-through go normalizza effort e conserva la risposta Anthropic', async (t) => {
+test('go pass-through normalizes the effort and preserves the Anthropic response', async (t) => {
   let upstreamBody;
   let upstreamHeaders;
   const upstream = (await import('node:http')).default.createServer(async (req, res) => {
@@ -188,7 +188,7 @@ test('pass-through go normalizza effort e conserva la risposta Anthropic', async
     try {
       const health = await fetch(`http://127.0.0.1:${proxyPort}/health`);
       if (health.ok) break;
-    } catch { /* attende l'avvio */ }
+    } catch { /* wait for startup */ }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 
@@ -201,7 +201,7 @@ test('pass-through go normalizza effort e conserva la risposta Anthropic', async
     },
     body: JSON.stringify({
       model: 'gpt-two',
-      messages: [{ role: 'user', content: 'ciao' }],
+      messages: [{ role: 'user', content: 'hello' }],
       output_config: { effort: 'max', format: { type: 'json_schema' } },
       stream: false,
     }),

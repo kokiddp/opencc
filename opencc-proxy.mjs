@@ -1,35 +1,35 @@
 #!/usr/bin/env node
 /**
- * opencc-proxy — traduttore Anthropic Messages API → OpenAI Responses API.
+ * opencc-proxy — Anthropic Messages API → OpenAI Responses API translator.
  *
- * Claude Code parla solo il protocollo Anthropic (/v1/messages); i backend
- * OpenAI parlano il protocollo Responses. Questo proxy locale traduce le
- * richieste di Claude Code verso OpenAI in due modalità:
+ * Claude Code speaks only the Anthropic protocol (/v1/messages); the OpenAI
+ * backends speak the Responses protocol. This local proxy translates Claude
+ * Code's requests toward OpenAI in two modes:
  *
- *   subscription  (predefinita) → backend ChatGPT/Codex del piano ChatGPT
- *                                  (Plus/Pro/Team). Autenticazione OAuth letta
- *                                  da ~/.codex/auth.json (login `codex`).
- *   apikey                       → api.openai.com/v1 con OPENAI_API_KEY.
- *   go                           → pass-through Anthropic verso opencode-go;
- *                                  normalizza solo modello ed effort.
+ *   subscription  (default) → ChatGPT/Codex backend of the ChatGPT plan
+ *                              (Plus/Pro/Team). OAuth authentication read
+ *                              from ~/.codex/auth.json (login `codex`).
+ *   apikey                   → api.openai.com/v1 with OPENAI_API_KEY.
+ *   go                       → Anthropic pass-through to opencode-go;
+ *                              normalizes model and effort only.
  *
- * La logica di traduzione è adattata dal proxy MIT-licensed di
+ * The translation logic is adapted from the MIT-licensed proxy of
  * codex-for-claude-code (https://github.com/Yusang-park/codex-for-claude-code).
  *
- * Uso (standalone):
+ * Usage (standalone):
  *   OPENCC_MODE=subscription node opencc-proxy.mjs
  *
- * Variabili d'ambiente:
+ * Environment variables:
  *   OPENCC_MODE            subscription (default) | apikey | go
- *   OPENCC_PROXY_PORT      porta di ascolto (default: 3199)
- *   OPENAI_API_KEY         chiave API OpenAI (solo modalità apikey)
- *   OPENAI_API_BASE        upstream API (default: https://api.openai.com/v1)
- *   CHATGPT_API_BASE       upstream abbonamento (default: https://chatgpt.com/backend-api/codex)
- *   OPENCC_FALLBACK_MODEL  modello OpenAI usato quando Claude Code richiede claude-*
- *   OPENCC_MODELS          elenco modelli (CSV) esposti da GET /v1/models
- *   OPENCC_EFFORT_POLICY_FILE  JSON con effort supportati/default per modello
- *   OPENCC_GO_BASE_URL     upstream Anthropic opencode-go (solo modalità go)
- *   OPENCODE_API_KEY       chiave x-api-key upstream (solo modalità go)
+ *   OPENCC_PROXY_PORT      listening port (default: 3199)
+ *   OPENAI_API_KEY         OpenAI API key (apikey mode only)
+ *   OPENAI_API_BASE        API upstream (default: https://api.openai.com/v1)
+ *   CHATGPT_API_BASE       subscription upstream (default: https://chatgpt.com/backend-api/codex)
+ *   OPENCC_FALLBACK_MODEL  OpenAI model used when Claude Code requests claude-*
+ *   OPENCC_MODELS          model list (CSV) exposed by GET /v1/models
+ *   OPENCC_EFFORT_POLICY_FILE  JSON with supported/default effort per model
+ *   OPENCC_GO_BASE_URL     opencode-go Anthropic upstream (go mode only)
+ *   OPENCODE_API_KEY       upstream x-api-key (go mode only)
  */
 import http from 'node:http';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
@@ -58,19 +58,19 @@ const API_BASE = (MODE === 'go'
     : (process.env.CHATGPT_API_BASE ?? 'https://chatgpt.com/backend-api/codex')
 ).replace(/\/+$/, '');
 
-// Client OAuth del CLI Codex: il refresh_token emesso dal device flow è legato
-// a questo client. Se possibile, il client_id viene letto dal claim del token.
+// Codex CLI OAuth client: the refresh_token issued by the device flow is bound
+// to this client. When possible, the client_id is read from the token claim.
 const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const AUTH_ENDPOINT = (process.env.OPENAI_AUTH_BASE ?? 'https://auth.openai.com/oauth/token');
 
-// ID claude-* che Claude Code potrebbe usare per i probe interni: li rimappa
-// sul modello scelto, altrimenti verrebbero inoltrati ad Anthropic e fallirebbero.
+// claude-* IDs that Claude Code might use for internal probes: remap them to
+// the chosen model, otherwise they would be forwarded to Anthropic and fail.
 const CLAUDE_MODEL_RE = /^claude-|^(opus|sonnet|haiku)(-|$)/i;
 
-// Finestre di contesto effettive (per il campo usage.context_window; il valore
-// usato da Claude Code viene impostato dallo script opencc via env).
-// Valore = max_context_window × effective_context_window_percent (95%) dalla
-// models_cache del CLI Codex.
+// Effective context windows (for the usage.context_window field; the value
+// used by Claude Code is set by the opencc script via env).
+// Value = max_context_window × effective_context_window_percent (95%) from the
+// Codex CLI models_cache.
 const MODEL_CONTEXT_WINDOWS = {
   'gpt-5.6-sol': 828400,
   'gpt-5.6-terra': 828400,
@@ -82,17 +82,17 @@ const MODEL_CONTEXT_WINDOWS = {
 };
 
 function getContextWindowForModel(model) {
-  // ignora l'eventuale suffisso @effort
+  // ignore any @effort suffix
   const id = (model ?? '').split('@')[0];
   return MODEL_CONTEXT_WINDOWS[id] ?? null;
 }
 
 /**
- * Converte l'usage della Responses API nel formato Anthropic: OpenAI include i
- * token in cache nel totale input_tokens e li scompone in
- * input_tokens_details.cached_tokens; Anthropic li vuole separati
- * (cache_read_input_tokens). Senza questa conversione /usage mostrerebbe input
- * gonfiato e zero in cache per il backend openai.
+ * Converts the Responses API usage into the Anthropic format: OpenAI includes
+ * the cached tokens in the input_tokens total and breaks them down in
+ * input_tokens_details.cached_tokens; Anthropic wants them separate
+ * (cache_read_input_tokens). Without this conversion /usage would show
+ * inflated input and zero cache for the openai backend.
  */
 export function extractUsage(usage = {}) {
   const cached = usage.input_tokens_details?.cached_tokens ?? 0;
@@ -132,7 +132,7 @@ function buildUsagePayload(model, usage = {}) {
   return payload;
 }
 
-// ── Auth: chiave API oppure token OAuth del CLI Codex ─────────────────────────
+// ── Auth: API key or Codex CLI OAuth token ───────────────────────────────────
 export function resolveAuth() {
   if (MODE === 'apikey') {
     return OPENAI_API_KEY ? { token: OPENAI_API_KEY, accountId: null } : null;
@@ -150,11 +150,11 @@ export function resolveAuth() {
 
 function authHint() {
   return MODE === 'subscription'
-    ? 'Token OAuth scaduto. Esegui `opencc login` (o `codex login --device-auth`).'
-    : 'Imposta la variabile OPENAI_API_KEY.';
+    ? 'OAuth token expired. Run `opencc login` (or `codex login --device-auth`).'
+    : 'Set the OPENAI_API_KEY environment variable.';
 }
 
-// ── Refresh OAuth (rinnovo invisibile del token, come fa il CLI Codex) ───────
+// ── OAuth refresh (silent token renewal, like the Codex CLI does) ─────────────
 export function readAuth() {
   try {
     if (existsSync(CODEX_AUTH_PATH)) {
@@ -179,8 +179,8 @@ function clientIdFromJwt(token) {
   } catch { return null; }
 }
 
-// Rinnova access_token via refresh_token e riscrive ~/.codex/auth.json.
-// Ritorna il nuovo access_token o null in caso di errore.
+// Renews the access_token via refresh_token and rewrites ~/.codex/auth.json.
+// Returns the new access_token, or null on error.
 export async function refreshAuth(auth) {
   const refreshToken = auth?.tokens?.refresh_token;
   if (!refreshToken) return null;
@@ -214,7 +214,7 @@ export async function refreshAuth(auth) {
   } catch { return null; }
 }
 
-// ── Specifica modello: "gpt-5.6-sol@high" → { id, effort } ───────────────────
+// ── Model spec: "gpt-5.6-sol@high" → { id, effort } ──────────────────────────
 function parseModelSpec(model) {
   if (!model) return { id: '', effort: null };
   const m = model.match(/^([^@]+)(?:@(.+))?$/);
@@ -238,10 +238,10 @@ function readEffortPolicy(model) {
 }
 
 /**
- * Applica la policy reale del modello all'effort globale inviato da Claude Code.
- * Il client non conosce le capability dei modelli custom e non può filtrare
- * /effort: valori non supportati vengono ridotti al massimo livello disponibile
- * non superiore a quello richiesto; se non esiste, al minimo disponibile.
+ * Applies the model's real policy to the global effort sent by Claude Code.
+ * The client has no knowledge of custom-model capabilities and cannot filter
+ * /effort: unsupported values are reduced to the highest available level not
+ * exceeding the requested one; if none exists, to the lowest available.
  */
 export function normalizeEffort(model, requestedEffort, policy = readEffortPolicy(model)) {
   if (!policy) {
@@ -287,8 +287,8 @@ function normalizeMessagesBody(body, spec) {
   const normalizedEffort = normalizeEffort(spec.id, requestedEffort);
   if (normalizedEffort.requested !== normalizedEffort.applied) {
     console.error(
-      `[opencc] effort ${spec.id}: ${normalizedEffort.requested ?? '(nessuno)'} -> `
-      + `${normalizedEffort.applied ?? '(rimosso)'} (${normalizedEffort.reason})`,
+      `[opencc] effort ${spec.id}: ${normalizedEffort.requested ?? '(none)'} -> `
+      + `${normalizedEffort.applied ?? '(removed)'} (${normalizedEffort.reason})`,
     );
   }
 
@@ -309,14 +309,15 @@ function normalizeMessagesBody(body, spec) {
   return { normalizedBody, normalizedEffort };
 }
 
-// ── Collegamento tra turni (previous_response_id + input delta) ───────────────
-// Codex non rimanda mai l'intera storia: verifica che la nuova richiesta sia
-// un'estensione della precedente e invia solo il delta con previous_response_id;
-// il server ricollega il contesto e fattura la parte ripetuta a tariffa cache.
-// Senza questo, ogni turno rimanda la storia completa via HTTP: se la cache
-// automatica (TTL ~5 min) scade, l'intero contesto viene rifatturato ogni volta.
-// Lo stato è chiavato per sessione+agente (x-claude-code-session-id e
-// x-claude-code-agent-id, inviati da Claude Code su ogni richiesta).
+// ── Turn chaining (previous_response_id + input delta) ────────────────────────
+// Codex never resends the full history: it checks that the new request is an
+// extension of the previous one and sends only the delta with
+// previous_response_id; the server reconnects the context and bills the
+// repeated part at cache rates. Without this, every turn resends the full
+// history over HTTP: when the automatic cache (TTL ~5 min) expires, the whole
+// context is re-billed every time. State is keyed by session+agent
+// (x-claude-code-session-id and x-claude-code-agent-id, sent by Claude Code on
+// every request).
 
 const CONVERSATIONS = new Map();
 
@@ -350,8 +351,8 @@ export function isExtension(baseline, input) {
   return true;
 }
 
-/** Normalizza gli arguments di un function_call: il round-trip raw→oggetto→JSON
- *  è deterministico, quindi coincide con ciò che Claude Code rispedisce. */
+/** Normalizes the arguments of a function_call: the raw→object→JSON round-trip
+ *  is deterministic, so it matches what Claude Code resends. */
 export function normalizeArguments(raw) {
   try {
     return JSON.stringify(JSON.parse(raw ?? '{}'));
@@ -360,8 +361,8 @@ export function normalizeArguments(raw) {
   }
 }
 
-/** Stato della conversazione dopo una risposta: input inviato, item di output
- *  canonici, proprietà della richiesta e id della risposta. */
+/** Conversation state after a response: input sent, canonical output items,
+ *  request properties and the response id. */
 function rememberConversation(key, state) {
   CONVERSATIONS.set(key, state);
 }
@@ -370,13 +371,14 @@ function forgetConversation(key) {
   if (key) CONVERSATIONS.delete(key);
 }
 
-// ── Copia di intestazioni risposta (per il pass-through) ──────────────────────
+// ── Response header copying (for the pass-through) ────────────────────────────
 function copyResponseHeaders(headers) {
   const result = {};
   for (const [name, value] of headers) {
-    // content-encoding va tolto: fetch (undici) decompressa già il body, quindi
-    // inoltrare l'header originale farebbe fallire la decompressione a Claude
-    // Code (BrotliDecompressionError). Chiediamo comunque identity all'upstream.
+    // content-encoding must be stripped: fetch (undici) already decompresses
+    // the body, so forwarding the original header would make the
+    // decompression fail on Claude Code (BrotliDecompressionError). We ask
+    // the upstream for identity anyway.
     if (!['connection', 'content-length', 'transfer-encoding', 'content-encoding'].includes(name.toLowerCase())) {
       result[name] = value;
     }
@@ -387,14 +389,14 @@ function copyResponseHeaders(headers) {
 async function pipeAnthropicGo(req, res, url, body, fetchImpl) {
   if (!OPENCODE_API_KEY) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'OPENCODE_API_KEY mancante.' } }));
+    res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'OPENCODE_API_KEY is missing.' } }));
     return;
   }
   const requestedModel = body.model ?? '';
   const spec = resolveModelSpec(requestedModel);
   if (!spec) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Modello '${requestedModel}' non gestito.` } }));
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: `Model '${requestedModel}' not handled.` } }));
     return;
   }
   const { normalizedBody } = normalizeMessagesBody(body, spec);
@@ -405,8 +407,8 @@ async function pipeAnthropicGo(req, res, url, body, fetchImpl) {
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': OPENCODE_API_KEY,
-        // Niente compressione upstream: evita che il pass-through inoltri un
-        // Content-Encoding su un body già decompresso da fetch.
+        // No upstream compression: prevents the pass-through from forwarding
+        // a Content-Encoding on a body already decompressed by fetch.
         'Accept-Encoding': 'identity',
         ...(req.headers['anthropic-version'] ? { 'anthropic-version': req.headers['anthropic-version'] } : {}),
         ...(req.headers['anthropic-beta'] ? { 'anthropic-beta': req.headers['anthropic-beta'] } : {}),
@@ -415,7 +417,7 @@ async function pipeAnthropicGo(req, res, url, body, fetchImpl) {
     });
   } catch (err) {
     res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: `Errore upstream OpenCode Go: ${err.message}` } }));
+    res.end(JSON.stringify({ error: { message: `OpenCode Go upstream error: ${err.message}` } }));
     return;
   }
 
@@ -426,15 +428,15 @@ async function pipeAnthropicGo(req, res, url, body, fetchImpl) {
   }
   try {
     for await (const chunk of upstreamRes.body) res.write(chunk);
-  } catch { /* il client o l'upstream ha chiuso lo stream */ }
+  } catch { /* the client or the upstream closed the stream */ }
   res.end();
 }
 
-// ── Conversione richiesta Anthropic → Responses API ──────────────────────────
+// ── Anthropic request → Responses API conversion ─────────────────────────────
 /**
- * Costruisce gli item di input della Responses API a partire dai messaggi
- * Anthropic. Usata sia per la richiesta sia per il confronto di estensione del
- * collegamento tra turni: deve quindi produrre item canonici e deterministici.
+ * Builds the Responses API input items from the Anthropic messages. Used both
+ * for the request and for the turn-chaining extension check: it must therefore
+ * produce canonical, deterministic items.
  */
 export function buildInputItems(messages) {
   const input = [];
@@ -480,9 +482,9 @@ export function buildResponsesAPIRequest(body, modelEffort) {
       : body.system.filter((b) => b.type === 'text').map((b) => b.text).join('');
   }
 
-  // Il backend ChatGPT richiede store=false e stream=true; l'API OpenAI
-  // accetta gli stessi parametri. I client non-stream vengono gestiti
-  // raccogliendo gli eventi SSE.
+  // The ChatGPT backend requires store=false and stream=true; the OpenAI API
+  // accepts the same parameters. Non-stream clients are handled by collecting
+  // the SSE events.
   const req = {
     model: body.model,
     input,
@@ -492,8 +494,8 @@ export function buildResponsesAPIRequest(body, modelEffort) {
 
   req.instructions = instructions || 'You are a helpful assistant.';
 
-  // /effort di Claude Code arriva come output_config.effort. Il suffisso storico
-  // modello@effort resta supportato e ha precedenza per compatibilità.
+  // Claude Code's /effort arrives as output_config.effort. The historical
+  // model@effort suffix stays supported and takes precedence for compatibility.
   const effort = modelEffort || body.output_config?.effort;
   if (effort) {
     req.reasoning = { effort };
@@ -508,12 +510,12 @@ export function buildResponsesAPIRequest(body, modelEffort) {
     }));
   }
 
-  // I backend OpenAI rifiutano i parametri di limiti token: NON includere
+  // The OpenAI backends reject token-limit parameters: do NOT include
   // max_output_tokens.
   return req;
 }
 
-// ── Conversione risposta Responses API → Anthropic ───────────────────────────
+// ── Responses API response → Anthropic ───────────────────────────────────────
 function translateResponsesAPIResponse(resp, originalModel) {
   const content = [];
   const usage = extractUsage(resp.usage);
@@ -558,13 +560,13 @@ function formatSSE(event, data) {
 function resolveModelSpec(model) {
   const spec = parseModelSpec(model ?? '');
   if (CLAUDE_MODEL_RE.test(spec.id)) {
-    // richieste claude-* → modello scelto (che può avere a sua volta @effort)
+    // claude-* requests → the chosen model (which may itself carry @effort)
     return FALLBACK_MODEL ? parseModelSpec(FALLBACK_MODEL) : null;
   }
   return spec;
 }
 
-// ── Server HTTP ───────────────────────────────────────────────────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 export function createServer({ fetchImpl = fetch } = {}) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${PORT}`);
@@ -620,7 +622,7 @@ export function createServer({ fetchImpl = fetch } = {}) {
       res.end(JSON.stringify({
         error: {
           type: 'invalid_request_error',
-          message: `Modello '${requestedModel}' non gestito: configura OPENCC_FALLBACK_MODEL con un modello OpenAI.`,
+          message: `Model '${requestedModel}' not handled: set OPENCC_FALLBACK_MODEL to an OpenAI model.`,
         },
       }));
       return;
@@ -630,14 +632,14 @@ export function createServer({ fetchImpl = fetch } = {}) {
     if (!auth) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        error: { type: 'authentication_error', message: `Autenticazione non trovata. ${authHint()}` },
+        error: { type: 'authentication_error', message: `Authentication not found. ${authHint()}` },
       }));
       return;
     }
 
     const { normalizedBody, normalizedEffort } = normalizeMessagesBody(body, spec);
-    // buildResponsesAPIRequest riceve l'effort separatamente per tradurlo in
-    // reasoning.effort; rimuovilo dal body Anthropic normalizzato.
+    // buildResponsesAPIRequest receives the effort separately to translate it
+    // into reasoning.effort; remove it from the normalized Anthropic body.
     if (normalizedBody.output_config) {
       normalizedBody.output_config = { ...normalizedBody.output_config };
       delete normalizedBody.output_config.effort;
@@ -646,10 +648,10 @@ export function createServer({ fetchImpl = fetch } = {}) {
     const responsesReq = buildResponsesAPIRequest(normalizedBody, normalizedEffort.applied);
     const isStream = body.stream === true;
 
-    // Collegamento tra turni: se la richiesta è un'estensione della precedente
-    // per la stessa sessione, inviamo solo il delta con previous_response_id
-    // (come fa codex). In caso di errore upstream si ripiega sulla richiesta
-    // completa senza collegamento.
+    // Turn chaining: if the request is an extension of the previous one for
+    // the same session, we send only the delta with previous_response_id
+    // (like codex does). On upstream error we fall back to the full request
+    // without chaining.
     const input = responsesReq.input;
     const props = canonicalProps(normalizedBody, spec);
     const key = isStream ? sessionKey(req.headers) : null;
@@ -669,10 +671,10 @@ export function createServer({ fetchImpl = fetch } = {}) {
       }
     }
     if (!linked && key && conv && conv.props !== props) {
-      forgetConversation(key); // contesto cambiato (modello, system o tools)
+      forgetConversation(key); // context changed (model, system or tools)
     }
     if (linked) {
-      console.error(`[opencc] delta ${key}: ${deltaInput.length} item inviati (baseline ${baseline.length})`);
+      console.error(`[opencc] delta ${key}: ${deltaInput.length} items sent (baseline ${baseline.length})`);
     }
 
     const doFetch = (token, accountId) => fetchImpl(`${API_BASE}/responses`, {
@@ -686,7 +688,7 @@ export function createServer({ fetchImpl = fetch } = {}) {
     });
 
     const fullFetch = (token, accountId) => {
-      // Riprova senza collegamento: input completo e niente previous_response_id.
+      // Retry without chaining: full input and no previous_response_id.
       const fullReq = { ...responsesReq };
       delete fullReq.previous_response_id;
       fullReq.input = input;
@@ -704,17 +706,17 @@ export function createServer({ fetchImpl = fetch } = {}) {
     let upstreamRes;
     try {
       upstreamRes = await doFetch(auth.token, auth.accountId);
-      // Token OAuth scaduto: prova a rinnovarlo col refresh_token e riprova.
+      // Expired OAuth token: try renewing it with the refresh_token and retry.
       if (upstreamRes.status === 401 && MODE === 'subscription') {
         const fresh = await refreshAuth(readAuth());
         if (fresh) {
           upstreamRes = await doFetch(fresh, readAuth()?.tokens?.account_id ?? auth.accountId);
         }
       }
-      // Il collegamento può fallire (es. risposta scaduta lato server): ritenta
-      // con la richiesta completa e azzera lo stato della conversazione.
+      // Chaining can fail (e.g. response expired server-side): retry with the
+      // full request and reset the conversation state.
       if (linked && !upstreamRes.ok) {
-        console.error(`[opencc] delta fallito (${upstreamRes.status}): ritenta senza collegamento`);
+        console.error(`[opencc] delta failed (${upstreamRes.status}): retrying without chaining`);
         const token = MODE === 'subscription' ? readAuth()?.tokens?.access_token ?? auth.token : auth.token;
         const accountId = readAuth()?.tokens?.account_id ?? auth.accountId;
         upstreamRes = await fullFetch(token, accountId);
@@ -723,7 +725,7 @@ export function createServer({ fetchImpl = fetch } = {}) {
       }
     } catch (err) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `Errore upstream: ${err.message}` } }));
+      res.end(JSON.stringify({ error: { message: `Upstream error: ${err.message}` } }));
       return;
     }
 
@@ -733,7 +735,7 @@ export function createServer({ fetchImpl = fetch } = {}) {
       try {
         const j = JSON.parse(errText);
         if (j?.error?.message) message = j.error.message;
-      } catch { /* testo grezzo */ }
+      } catch { /* raw text */ }
       if (upstreamRes.status === 401) {
         message = `${message} ${authHint()}`;
       }
@@ -760,8 +762,8 @@ export function createServer({ fetchImpl = fetch } = {}) {
         nextBlockIdx: 0,
         blocks: new Map(),
         hasToolUse: false,
-        // Raccolta degli item di output in forma canonica, per il collegamento
-        // tra turni (baseline del prossimo confronto di estensione).
+        // Collection of the output items in canonical form, for the turn
+        // chaining (baseline of the next extension check).
         respTexts: new Map(),
         respToolCalls: new Map(),
         respId: null,
@@ -835,8 +837,8 @@ export function createServer({ fetchImpl = fetch } = {}) {
 
             if (evt.type === 'response.completed' || evt.type === 'response.done') {
               finalResponse = evt.response ?? evt;
-              // /usage accumula input/cache dall'usage del message_delta finale:
-              // serve l'usage completo, non solo output_tokens.
+              // /usage accumulates input/cache from the final message_delta
+              // usage: the full usage is needed, not just output_tokens.
               streamUsage = extractUsage(finalResponse.usage);
               state.respId = finalResponse.id ?? null;
               continue;
@@ -894,8 +896,8 @@ export function createServer({ fetchImpl = fetch } = {}) {
 
       for (const [oi] of state.blocks) closeBlock(oi);
 
-      // Ricorda la conversazione per il collegamento del prossimo turno, e
-      // registra l'usage per diagnostica (verifica del risparmio cache).
+      // Remember the conversation for the next turn's chaining, and record
+      // the usage for diagnostics (verifying the cache savings).
       const responseItems = [];
       const allIdx = new Set([...state.respTexts.keys(), ...state.respToolCalls.keys()]);
       for (const oi of [...allIdx].sort((a, b) => a - b)) {
@@ -957,7 +959,7 @@ export function createServer({ fetchImpl = fetch } = {}) {
       }
       res.end();
     } else {
-      // Client non-stream: raccogli gli eventi SSE e costruisci una risposta Anthropic.
+      // Non-stream client: collect the SSE events and build an Anthropic response.
       let collectedText = '';
       const collectedToolCalls = [];
       let collectedUsage = { input_tokens: 0, output_tokens: 0 };
@@ -1013,7 +1015,7 @@ export function createServer({ fetchImpl = fetch } = {}) {
         }));
       } else {
         res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'Nessuna risposta ricevuta dal backend OpenAI' } }));
+        res.end(JSON.stringify({ error: { message: 'No response received from the OpenAI backend' } }));
       }
     }
   });
@@ -1023,16 +1025,16 @@ export function startServer() {
   const server = createServer();
 
   server.listen(PORT, '127.0.0.1', () => {
-    process.stderr.write(`[opencc-proxy] in ascolto su http://127.0.0.1:${PORT} (mode=${MODE})\n`);
+    process.stderr.write(`[opencc-proxy] listening on http://127.0.0.1:${PORT} (mode=${MODE})\n`);
     process.stderr.write(`[opencc-proxy] upstream=${API_BASE}\n`);
   });
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      // Già in esecuzione — esci in silenzio.
+      // Already running — exit silently.
       process.exit(0);
     }
-    process.stderr.write(`[opencc-proxy] errore: ${err.message}\n`);
+    process.stderr.write(`[opencc-proxy] error: ${err.message}\n`);
     process.exit(1);
   });
 
