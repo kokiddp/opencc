@@ -1103,3 +1103,45 @@ fn subscription_falls_back_to_http_when_websocket_is_unavailable() {
     drop(requests);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn subscription_ws_failure_is_relayed_as_an_error_event() {
+    let mock = start_ws_mock(|_frame: &Value, _conn: usize| {
+        // The backend refuses (e.g. quota exhausted): response.failed.
+        vec![json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_fail_1",
+                "error": {"type": "server_error", "message": "Rate limit reached, try again later"},
+            }
+        })]
+    });
+    let home = ws_test_home("fail");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let c = client();
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-{}", std::process::id());
+
+    let resp = c
+        .post(format!("{base}/v1/messages"))
+        .header("x-claude-code-session-id", session.as_str())
+        .json(&json!({
+            "model": "gpt-two",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        }))
+        .send()
+        .unwrap();
+    let text = resp.text().unwrap();
+    let events = parse_sse(&text);
+    let error_evt = events
+        .iter()
+        .find(|(e, _)| e == "error")
+        .expect("the stream must carry an error event");
+    assert_eq!(error_evt.1["error"]["message"], "Rate limit reached, try again later");
+    // No retry was burned: exactly one frame upstream.
+    let frames = mock.frames.lock().unwrap();
+    assert_eq!(frames.len(), 1);
+    drop(frames);
+    let _ = std::fs::remove_dir_all(&home);
+}

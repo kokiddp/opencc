@@ -1158,7 +1158,9 @@ async fn ws_attempt(
             return WsAttempt::Fallback;
         }
     };
-    if matches!(s(&first, "type"), Some("error") | Some("response.failed")) {
+    if s(&first, "type") == Some("error") {
+        // The request was rejected (stale previous_response_id, connection
+        // limit): reconnect and retry with the full input.
         ctx.ws_sessions.kill(key, gen);
         return if chain.linked {
             WsAttempt::RetryFull
@@ -1166,6 +1168,9 @@ async fn ws_attempt(
             WsAttempt::Fallback
         };
     }
+    // response.failed (quota, policy) streams normally: the translation
+    // relays it to the client as an Anthropic error event, without burning
+    // another request on a retry.
 
     let (sender, body) = Channel::new(64);
     let mut resp = Response::new(body);
@@ -1562,6 +1567,9 @@ struct StreamState {
     fresh_est: u64,
     /// Estimated size of the reconnected context (for message_start).
     cached_est: u64,
+    /// Set when the upstream failed the response mid-stream (quota,
+    /// policy): the stream is terminated by an Anthropic error event.
+    failed: Option<String>,
 }
 
 struct BlockInfo {
@@ -1589,6 +1597,7 @@ impl StreamState {
             stream_usage: None,
             fresh_est: 0,
             cached_est: 0,
+            failed: None,
         }
     }
 
@@ -1659,6 +1668,39 @@ fn process_upstream_event(
             // output_tokens.
             state.stream_usage = Some(extract_usage(resp.get("usage")));
             state.resp_id = resp.get("id").and_then(|v| v.as_str()).map(String::from);
+        }
+        Some("response.failed") => {
+            let resp = evt.get("response").unwrap_or(evt);
+            let message = resp
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| s(resp, "error"))
+                .unwrap_or("Upstream request failed")
+                .to_string();
+            state.failed = Some(message.clone());
+            out.push((
+                "error".to_string(),
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message},
+                }),
+            ));
+        }
+        Some("error") => {
+            // Upstream error frame (e.g. quota refusal mid-stream).
+            let message = evt
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Upstream error")
+                .to_string();
+            state.failed = Some(message.clone());
+            out.push((
+                "error".to_string(),
+                json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message},
+                }),
+            ));
         }
         Some("response.output_item.added") => {
             if let Some(item) = evt.get("item") {
@@ -1910,6 +1952,11 @@ async fn finalize_stream(
         if chain.linked { "delta" } else { "full" }
     );
 
+    if state.failed.is_some() {
+        // The Anthropic error event already terminated the stream.
+        return;
+    }
+
     if state.started {
         emit!(
             "message_delta",
@@ -2045,7 +2092,10 @@ async fn ws_stream_translation(
         // the end of this response.
         let terminal = matches!(
             s(&evt, "type"),
-            Some("response.completed") | Some("response.done")
+            Some("response.completed")
+                | Some("response.done")
+                | Some("response.failed")
+                | Some("error")
         );
         if !send_translated(&mut state, &evt, original_model, &mut sender).await {
             aborted = true;
