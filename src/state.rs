@@ -32,7 +32,24 @@ pub fn state_root() -> PathBuf {
 }
 
 /// The user's home directory.
+///
+/// Checks the `HOME` (Unix) or `USERPROFILE` (Windows) environment variable
+/// first so that tests and tools can redirect the home directory by setting
+/// the variable in the spawned process's environment.  Falls back to the
+/// platform API via `dirs::home_dir()` when the variable is absent or empty.
 pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    if let Ok(p) = std::env::var("HOME") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(p) = std::env::var("USERPROFILE") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
     dirs::home_dir()
 }
 
