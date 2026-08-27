@@ -91,14 +91,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-      - name: Build (zigbuild)
-        run: cargo zigbuild --release --target "${{ matrix.target }}"
+      - name: Build
+        run: cargo build --release --target "${{ matrix.target }}"
       - name: Package
         run: |
           set -euo pipefail
