@@ -1,0 +1,147 @@
+name: Release
+
+# Builds release binaries for every supported platform/architecture and
+# drafts a semver-tagged release on every push to master (the tag is
+# v<version> from Cargo.toml). Re-running with the same version refreshes the
+# draft (delete + recreate).
+#
+# Targets:
+#   linux-gnu (glibc 2.17, .2.17 suffix → runs on old distros incl.
+#              Raspberry Pi 0/1 on Raspbian): x86_64, i686, aarch64,
+#              armv7 (gnueabihf), arm/armv6 (gnueabihf), riscv64gc
+#   linux-musl (fully static): x86_64, aarch64
+#   windows-gnu: x86_64, i686   (no aarch64-pc-windows-gnu — removed from rustc)
+#   darwin: x86_64 (Intel), aarch64 (Apple Silicon)
+#
+# Note: riscv64gc-unknown-linux-gnu and i686-pc-windows-gnu are not in
+# cargo-zigbuild's own CI matrix, so they are smoke-built on every release.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu.2.17
+          - i686-unknown-linux-gnu.2.17
+          - aarch64-unknown-linux-gnu.2.17
+          - armv7-unknown-linux-gnueabihf.2.17
+          - arm-unknown-linux-gnueabihf.2.17
+          - riscv64gc-unknown-linux-gnu.2.17
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-gnu
+          - i686-pc-windows-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # rustup does not know the .2.17 glibc suffix: add the bare target.
+      - name: Add target
+        run: rustup target add "${TARGET%%.*}"
+        env:
+          TARGET: ${{ matrix.target }}
+      - uses: ziglang/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (zigbuild)
+        run: cargo zigbuild --release --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          # Asset name without the glibc suffix.
+          name="${target%%.*}"
+          bin_dir="target/${target}/release"
+          [ -f "$bin_dir/opencc" ] || bin_dir="target/${name}/release"
+          mkdir -p dist
+          cp "$bin_dir/opencc" "dist/opencc-${name}"
+          cp "$bin_dir/opencc-proxy" "dist/opencc-proxy-${name}"
+          if [[ "${target}" == *pc-windows-gnu ]]; then
+            mv "dist/opencc-${name}" "dist/opencc-${name}.exe"
+            mv "dist/opencc-proxy-${name}" "dist/opencc-proxy-${name}.exe"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  build-macos:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: ziglang/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build (zigbuild)
+        run: cargo zigbuild --release --target "${{ matrix.target }}"
+      - name: Package
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${target}/release/opencc" "dist/opencc-${target}"
+          cp "target/${target}/release/opencc-proxy" "dist/opencc-proxy-${target}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: draft release v${{ env.VERSION }}
+    needs: [build, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute version (Cargo.toml semver)
+        run: |
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > sha256sums.txt
+          ls -la
+      # Drafts are always deletable; this refreshes the draft when the same
+      # version is pushed again.
+      - name: Delete previous draft (same version)
+        run: gh release delete "v${{ env.VERSION }}" --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Create draft release + upload assets
+        run: |
+          gh release create "v${{ env.VERSION }}" --draft --target "${{ github.sha }}" \
+            --title "opencc v${{ env.VERSION }}" \
+            --notes "Rust rewrite of opencc + opencc-proxy. See the [README](https://github.com/${{ github.repository }}/blob/master/README.md) for installation and the [plan](https://github.com/${{ github.repository }}/blob/master/PLAN.md) for the architecture."
+          gh release upload "v${{ env.VERSION }}" artifacts/* --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
