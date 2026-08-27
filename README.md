@@ -17,6 +17,28 @@ toccare endpoint, autenticazione, modello, effort o settings.
 
 ## Installazione
 
+Dalla directory del repository:
+
+```bash
+./install.sh
+```
+
+Lo script verifica che **Claude Code** (`claude`) sia installato — se manca,
+propone di installarlo (installer ufficiale via `curl`, fallback `npm`) — e solo
+poi copia `opencc` e `opencc-proxy.mjs` in `~/.opencc/`, collegandoli a
+`~/.local/bin/` con due symlink:
+
+```bash
+~/.local/bin/opencc            -> ~/.opencc/opencc
+~/.local/bin/opencc-proxy.mjs  -> ~/.opencc/opencc-proxy.mjs
+```
+
+Rilanciare `install.sh` dopo un aggiornamento aggiorna i file in `~/.opencc`
+senza toccare i symlink. I due file devono restare affiancati: `opencc` cerca
+`opencc-proxy.mjs` nella propria directory (serve ai backend `openai` e `go`).
+
+### Installazione manuale
+
 Copiare `opencc` **e** `opencc-proxy.mjs` nella stessa directory del `PATH`
 (es. `~/.local/bin/`) e rendere eseguibile `opencc`:
 
@@ -24,9 +46,6 @@ Copiare `opencc` **e** `opencc-proxy.mjs` nella stessa directory del `PATH`
 cp opencc opencc-proxy.mjs ~/.local/bin/
 chmod +x ~/.local/bin/opencc
 ```
-
-I due file devono restare affiancati: `opencc` cerca `opencc-proxy.mjs` nella
-propria directory (serve ai backend `openai` e `go`).
 
 ## Prerequisiti
 
