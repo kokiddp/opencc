@@ -1138,7 +1138,10 @@ fn subscription_ws_failure_is_relayed_as_an_error_event() {
         .iter()
         .find(|(e, _)| e == "error")
         .expect("the stream must carry an error event");
-    assert_eq!(error_evt.1["error"]["message"], "Rate limit reached, try again later");
+    assert_eq!(
+        error_evt.1["error"]["message"],
+        "Rate limit reached, try again later"
+    );
     // No retry was burned: exactly one frame upstream.
     let frames = mock.frames.lock().unwrap();
     assert_eq!(frames.len(), 1);
