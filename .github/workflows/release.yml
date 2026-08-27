@@ -43,7 +43,7 @@ jobs:
           - i686-pc-windows-gnu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       # rustup does not know the .2.17 glibc suffix: add the bare target.
       - name: Add target
@@ -87,7 +87,7 @@ jobs:
         target: [x86_64-apple-darwin, aarch64-apple-darwin]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -120,7 +120,7 @@ jobs:
     needs: [build, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Compute version (Cargo.toml semver)
         run: |
           VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
