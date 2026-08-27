@@ -50,7 +50,7 @@ jobs:
         run: rustup target add "${TARGET%%.*}"
         env:
           TARGET: ${{ matrix.target }}
-      - uses: ziglang/setup-zig@v2
+      - uses: mlugg/setup-zig@v1
         with:
           version: 0.16.0
       - uses: taiki-e/install-action@v2
@@ -91,7 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: ziglang/setup-zig@v2
+      - uses: mlugg/setup-zig@v1
         with:
           version: 0.16.0
       - uses: taiki-e/install-action@v2
