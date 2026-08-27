@@ -19,7 +19,8 @@ use crate::effort::{
 };
 use crate::state;
 use crate::util::jwt_payload;
-use futures_util::StreamExt;
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Channel};
 use hyper::body::Bytes;
 use hyper::service::service_fn;
@@ -30,6 +31,13 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMessage};
+
+/// The upstream WebSocket connection type (TLS or plain, per scheme).
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsWriter = SplitSink<WsStream, WsMessage>;
 
 /// The response body type used everywhere: a buffered channel written by the
 /// handler (hyper 1.x has no boxed `Body` type anymore; the old
@@ -168,6 +176,11 @@ pub fn extract_usage(usage: Option<&Value>) -> Usage {
         cache_creation_input_tokens: usage
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
+            .or_else(|| {
+                usage
+                    .pointer("/input_tokens_details/cache_write_tokens")
+                    .and_then(|v| v.as_u64())
+            })
             .unwrap_or(0),
     }
 }
@@ -203,6 +216,17 @@ fn build_usage_payload(model: &str, usage: &Usage) -> Value {
         payload["used_percentage"] = json!((total_input as f64) / (cw as f64) * 100.0);
     }
     payload
+}
+
+/// Rough token estimate of a request as sent (chars / 4, the usual heuristic).
+/// Used for the /usage cache columns: the ChatGPT backend does not report the
+/// reconnected context on chained turns, so the proxy reports its own
+/// estimate of the baseline instead.
+fn estimate_request_tokens(req: &Value) -> u64 {
+    let chars = serde_json::to_string(req)
+        .map(|s| s.chars().count() as u64)
+        .unwrap_or(0);
+    chars / 4
 }
 
 // ── Auth: API key or Codex CLI OAuth token ─────────────────────────────────────
@@ -539,6 +563,10 @@ struct ConvState {
     last_input: Vec<Value>,
     last_response_items: Vec<Value>,
     props: String,
+    /// Estimated tokens of everything sent so far in this conversation: the
+    /// size of the context the backend reconnects (and bills at cache rates)
+    /// on the next chained turn.
+    cumulative: u64,
 }
 
 #[derive(Default)]
@@ -571,6 +599,199 @@ fn session_key(headers: &hyper::header::HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     Some(format!("{session}|{agent}"))
+}
+
+// ── WebSocket upstream (subscription mode) ─────────────────────────────────────
+// The ChatGPT backend rejects `previous_response_id` on the plain HTTP
+// `/responses` endpoint ("Unsupported parameter"), so chaining over HTTP can
+// never succeed: every turn would fall back to a full resend of the whole
+// context at full input rate. The same backend serves the Responses protocol
+// over WebSocket, where `previous_response_id` + a delta input work (this is
+// how the codex CLI itself runs): the server reconnects the previous context
+// and bills the repeated part at cache rates. The proxy therefore keeps one
+// WebSocket connection per conversation (session|agent) and chains turns on
+// it, falling back to the HTTP path when the connection cannot be established
+// or the chained request fails.
+
+/// The WebSocket endpoint for the Responses API: same base, scheme swapped.
+fn ws_url_for(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}/responses")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}/responses")
+    } else {
+        format!("{base}/responses")
+    }
+}
+
+/// One WebSocket connection to the upstream, shared by all requests of one
+/// conversation. The reader task pumps server frames into `rx`; a request
+/// takes the receiver, consumes exactly its own response (up to
+/// response.completed), then puts it back.
+struct WsEntry {
+    /// Writer half of the connection (send serialized per frame).
+    writer: Arc<tokio::sync::Mutex<WsWriter>>,
+    /// Events from the reader task; None while a request is streaming.
+    rx: Option<mpsc::Receiver<Value>>,
+    /// Dropping this sender stops the reader task (which also drops the
+    /// socket once the writer is gone).
+    _abort: tokio::sync::watch::Sender<bool>,
+    /// Bumped on reconnect; a late task must not put its receiver back into
+    /// a newer entry.
+    gen: u64,
+    /// Set while a request streams on this connection.
+    in_flight: bool,
+}
+
+#[derive(Default)]
+struct WsSessions {
+    map: Mutex<HashMap<String, WsEntry>>,
+    next_gen: Mutex<u64>,
+}
+
+impl WsSessions {
+    /// Returns (writer lock guard, generation, event receiver) for `key`,
+    /// connecting a fresh session when none exists. `None` if the connection
+    /// could not be established.
+    async fn acquire(
+        &self,
+        key: &str,
+        config: &Config,
+        token: &str,
+        account_id: &Option<String>,
+    ) -> Option<WsAcquired> {
+        {
+            let mut map = self.map.lock().unwrap();
+            if let Some(entry) = map.get_mut(key) {
+                if !entry.in_flight {
+                    if let Some(rx) = entry.rx.take() {
+                        return Some(WsAcquired {
+                            writer: entry.writer.clone(),
+                            rx,
+                            gen: entry.gen,
+                        });
+                    }
+                }
+                // In-flight or receiver missing (connection torn down): drop
+                // the entry so we reconnect below.
+                map.remove(key);
+            }
+        }
+        let gen = {
+            let mut g = self.next_gen.lock().unwrap();
+            *g += 1;
+            *g
+        };
+        let (writer, rx, abort_tx) = ws_connect(config, token, account_id).await?;
+        let mut map = self.map.lock().unwrap();
+        let entry = map.entry(key.to_string()).or_insert(WsEntry {
+            writer,
+            rx: None,
+            _abort: abort_tx,
+            gen,
+            in_flight: false,
+        });
+        entry.gen = gen;
+        Some(WsAcquired {
+            writer: entry.writer.clone(),
+            rx,
+            gen,
+        })
+    }
+
+    /// Marks the streaming request finished: puts the receiver back and
+    /// clears the in-flight flag, unless the entry was replaced meanwhile.
+    fn release(&self, key: &str, gen: u64, rx: mpsc::Receiver<Value>) {
+        let mut map = self.map.lock().unwrap();
+        if let Some(entry) = map.get_mut(key) {
+            if entry.gen == gen {
+                entry.in_flight = false;
+                entry.rx = Some(rx);
+            }
+        }
+    }
+
+    /// Marks the session dead (client abort, fatal error): the connection is
+    /// dropped and the next request reconnects with a full resend.
+    fn kill(&self, key: &str, gen: u64) {
+        let mut map = self.map.lock().unwrap();
+        if let Some(entry) = map.get(key) {
+            if entry.gen == gen {
+                map.remove(key);
+            }
+        }
+    }
+}
+
+struct WsAcquired {
+    writer: Arc<tokio::sync::Mutex<WsWriter>>,
+    rx: mpsc::Receiver<Value>,
+    gen: u64,
+}
+
+/// Connects the Responses WebSocket and spawns the reader task. Returns the
+/// writer and the event receiver, or None on failure.
+async fn ws_connect(
+    config: &Config,
+    token: &str,
+    account_id: &Option<String>,
+) -> Option<(
+    Arc<tokio::sync::Mutex<WsWriter>>,
+    mpsc::Receiver<Value>,
+    tokio::sync::watch::Sender<bool>,
+)> {
+    let mut request = ws_url_for(&config.api_base).into_client_request().ok()?;
+    let headers = request.headers_mut();
+    headers.insert(
+        "Authorization",
+        hyper::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()?,
+    );
+    if let Some(aid) = account_id {
+        headers.insert(
+            "ChatGPT-Account-ID",
+            hyper::header::HeaderValue::from_str(aid).ok()?,
+        );
+    }
+    // Same product marker the codex CLI sends.
+    headers.insert(
+        "OAI-Product-Sku",
+        hyper::header::HeaderValue::from_static("codex"),
+    );
+
+    let connected = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .ok()?;
+    let (stream, _resp) = connected.ok()?;
+    let (writer, reader) = stream.split();
+    let (tx, rx) = mpsc::channel::<Value>(64);
+    let (abort_tx, mut abort_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            tokio::select! {
+                _ = abort_rx.changed() => break,
+                msg = reader.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            if let Ok(evt) = serde_json::from_str::<Value>(text.as_str()) {
+                                if tx.send(evt).await.is_err() {
+                                    break; // receiver gone: connection abandoned
+                                }
+                            }
+                        }
+                        // Close/ping/pong/binary frames need no translation.
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break,
+                    }
+                }
+            }
+        }
+    });
+    Some((Arc::new(tokio::sync::Mutex::new(writer)), rx, abort_tx))
 }
 
 // ── SSE helpers ────────────────────────────────────────────────────────────────
@@ -622,12 +843,14 @@ type Shared = Arc<ServerCtx>;
 struct ServerCtx {
     config: Config,
     conversations: ConversationStore,
+    ws_sessions: WsSessions,
     client: reqwest::Client,
 }
 
 pub async fn run(config: Config) -> Result<(), std::io::Error> {
     let ctx = Arc::new(ServerCtx {
         conversations: ConversationStore::default(),
+        ws_sessions: WsSessions::default(),
         client: reqwest::Client::new(),
         config,
     });
@@ -860,6 +1083,200 @@ async fn pipe_opencode_pass_through(
 
 // ── OpenAI path: Anthropic request → Responses request, response → Anthropic ──
 
+/// Outcome of one WebSocket request attempt.
+enum WsAttempt {
+    /// The response is streaming to the client.
+    Streamed(Response<ResBody>),
+    /// The upstream rejected the request (stale previous_response_id,
+    /// connection limit): reconnect and retry with the full input.
+    RetryFull,
+    /// The WebSocket path is not usable right now: fall back to HTTP.
+    Fallback,
+}
+
+/// Runs one request on the conversation's WebSocket connection and streams
+/// the translation. Reconnects when the connection is gone.
+async fn ws_attempt(
+    ctx: &Shared,
+    key: &str,
+    responses_req: &Value,
+    original_model: String,
+    spec: ModelSpec,
+    chain: ChainContext,
+) -> WsAttempt {
+    let Some((token, account_id)) = resolve_auth(&ctx.config) else {
+        return WsAttempt::Fallback;
+    };
+    let Some(acquired) = ctx
+        .ws_sessions
+        .acquire(key, &ctx.config, &token, &account_id)
+        .await
+    else {
+        return WsAttempt::Fallback;
+    };
+    let gen = acquired.gen;
+
+    // Exclusive use of the connection while this response streams.
+    {
+        let mut map = ctx.ws_sessions.map.lock().unwrap();
+        match map.get_mut(key) {
+            Some(entry) if entry.gen == gen => {
+                if entry.in_flight {
+                    return WsAttempt::Fallback; // concurrent request on the key
+                }
+                entry.in_flight = true;
+            }
+            _ => return WsAttempt::Fallback, // replaced while connecting
+        }
+    }
+
+    let mut frame = responses_req.clone();
+    frame["type"] = json!("response.create");
+    let frame_text = frame.to_string();
+    let send_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        acquired
+            .writer
+            .lock()
+            .await
+            .send(WsMessage::Text(frame_text.into())),
+    )
+    .await;
+    if !matches!(send_result, Ok(Ok(()))) {
+        ctx.ws_sessions.kill(key, gen);
+        return WsAttempt::Fallback;
+    }
+
+    // The first event decides: an error frame (invalid previous_response_id,
+    // 60-minute connection limit) means the request was rejected → retry the
+    // full input on a fresh connection; anything else starts the stream.
+    let mut rx = acquired.rx;
+    let first = match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+        Ok(Some(evt)) => evt,
+        _ => {
+            ctx.ws_sessions.kill(key, gen);
+            return WsAttempt::Fallback;
+        }
+    };
+    if matches!(s(&first, "type"), Some("error") | Some("response.failed")) {
+        ctx.ws_sessions.kill(key, gen);
+        return if chain.linked {
+            WsAttempt::RetryFull
+        } else {
+            WsAttempt::Fallback
+        };
+    }
+
+    let (sender, body) = Channel::new(64);
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        "Content-Type",
+        hyper::header::HeaderValue::from_static("text/event-stream"),
+    );
+    resp.headers_mut().insert(
+        "Cache-Control",
+        hyper::header::HeaderValue::from_static("no-cache"),
+    );
+    resp.headers_mut().insert(
+        "Connection",
+        hyper::header::HeaderValue::from_static("keep-alive"),
+    );
+    let ctx2 = ctx.clone();
+    let key_owned = key.to_string();
+    tokio::spawn(async move {
+        ws_stream_translation(
+            ctx2,
+            key_owned,
+            gen,
+            first,
+            rx,
+            sender,
+            &original_model,
+            &spec,
+            chain,
+        )
+        .await;
+    });
+    WsAttempt::Streamed(resp)
+}
+
+/// WebSocket path for subscription mode: chains turns with
+/// previous_response_id + delta on a persistent connection (the ChatGPT
+/// backend only supports chaining over WebSocket). Returns None when the
+/// path is unusable, restoring `responses_req` to the full input so the
+/// caller can fall back to HTTP.
+#[allow(clippy::too_many_arguments)] // internal plumbing: request context
+async fn ws_handle(
+    ctx: Shared,
+    key: String,
+    responses_req: &mut Value,
+    input_items: &[Value],
+    props: String,
+    linked: bool,
+    cached_est: u64,
+    original_model: &str,
+    spec: &ModelSpec,
+    _headers: &hyper::header::HeaderMap,
+) -> Option<Response<ResBody>> {
+    // Attempt 1: chained (delta + previous_response_id) when possible.
+    let chain = ChainContext {
+        key: Some(key.clone()),
+        linked,
+        input_items: input_items.to_vec(),
+        props: props.clone(),
+        est_this: estimate_request_tokens(responses_req),
+        cached_est,
+    };
+    match ws_attempt(
+        &ctx,
+        &key,
+        responses_req,
+        original_model.to_string(),
+        spec.clone(),
+        chain,
+    )
+    .await
+    {
+        WsAttempt::Streamed(resp) => return Some(resp),
+        WsAttempt::RetryFull => {
+            // The connection state is stale: reconnect with the full input.
+            ctx.conversations.forget(&key);
+            responses_req
+                .as_object_mut()
+                .map(|o| o.remove("previous_response_id"));
+            responses_req["input"] = json!(input_items);
+            let chain = ChainContext {
+                key: Some(key.clone()),
+                linked: false,
+                input_items: input_items.to_vec(),
+                props,
+                est_this: estimate_request_tokens(responses_req),
+                cached_est: 0,
+            };
+            if let WsAttempt::Streamed(resp) = ws_attempt(
+                &ctx,
+                &key,
+                responses_req,
+                original_model.to_string(),
+                spec.clone(),
+                chain,
+            )
+            .await
+            {
+                return Some(resp);
+            }
+        }
+        WsAttempt::Fallback => {}
+    }
+    // Restore the full input for the HTTP fallback.
+    responses_req
+        .as_object_mut()
+        .map(|o| o.remove("previous_response_id"));
+    responses_req["input"] = json!(input_items);
+    None
+}
+
 async fn handle_openai(
     ctx: Shared,
     headers: hyper::header::HeaderMap,
@@ -920,6 +1337,9 @@ async fn handle_openai(
     let mut linked = false;
     let mut delta_len = 0usize;
     let mut baseline_len = 0usize;
+    // Estimated size of the context this turn reconnects to (previous turns),
+    // for the /usage cache columns.
+    let mut cached_est = 0u64;
     if let Some(key) = &key {
         let mut props_changed = false;
         if let Some(conv) = ctx.conversations.get(key) {
@@ -932,6 +1352,7 @@ async fn handle_openai(
                     if !delta.is_empty() {
                         linked = true;
                         delta_len = delta.len();
+                        cached_est = conv.cumulative;
                         responses_req["previous_response_id"] = json!(conv.last_response_id);
                         responses_req["input"] = json!(delta);
                     }
@@ -951,6 +1372,40 @@ async fn handle_openai(
             delta_len,
             baseline_len
         );
+    }
+
+    // The model shown to the client is the one it sent (the node proxy's
+    // `originalModel`), so /usage and the message id look right to it.
+    let original_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Subscription mode: the ChatGPT backend rejects previous_response_id on
+    // the HTTP endpoint, so chaining only works over the WebSocket channel
+    // (as the codex CLI does). Try it first; on any failure the request falls
+    // back to the HTTP path below with the full input restored.
+    if let Some(k) = &key {
+        if ctx.config.mode == "subscription" {
+            if let Some(resp) = ws_handle(
+                ctx.clone(),
+                k.clone(),
+                &mut responses_req,
+                &input_items,
+                props.clone(),
+                linked,
+                cached_est,
+                &original_model,
+                &spec,
+                &headers,
+            )
+            .await
+            {
+                return resp;
+            }
+            linked = false; // ws_handle restored the full input
+        }
     }
 
     let do_fetch = |token: &str, account_id: &Option<String>| {
@@ -1049,13 +1504,6 @@ async fn handle_openai(
         return json_response(status, &json!({"error": {"message": message}})).await;
     }
 
-    // The model shown to the client is the one it sent (the node proxy's
-    // `originalModel`), so /usage and the message id look right to it.
-    let original_model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
     if is_stream {
         let (sender, body) = Channel::new(64);
         let mut resp = Response::new(body);
@@ -1084,6 +1532,8 @@ async fn handle_openai(
                     linked,
                     input_items,
                     props,
+                    est_this: estimate_request_tokens(&responses_req),
+                    cached_est: if linked { cached_est } else { 0 },
                 },
             )
             .await;
@@ -1106,6 +1556,12 @@ struct StreamState {
     resp_texts: HashMap<usize, String>,
     resp_tool_calls: HashMap<usize, ToolCallInfo>,
     resp_id: Option<String>,
+    /// Usage from the final response.completed/done event.
+    stream_usage: Option<Usage>,
+    /// Estimated usage of this request (for message_start).
+    fresh_est: u64,
+    /// Estimated size of the reconnected context (for message_start).
+    cached_est: u64,
 }
 
 struct BlockInfo {
@@ -1130,6 +1586,9 @@ impl StreamState {
             resp_texts: HashMap::new(),
             resp_tool_calls: HashMap::new(),
             resp_id: None,
+            stream_usage: None,
+            fresh_est: 0,
+            cached_est: 0,
         }
     }
 
@@ -1150,19 +1609,19 @@ impl StreamState {
     }
 }
 
-/// Writes `message_start` + `ping` once, before the first content block.
-async fn ensure_message_start(
-    state: &mut StreamState,
-    original_model: &str,
-    sender: &mut Option<http_body_util::channel::Sender<Bytes>>,
-) {
+/// Produces `message_start` + `ping` once, before the first content block.
+fn message_start_events(state: &mut StreamState, original_model: &str) -> Vec<(String, Value)> {
     if state.started {
-        return;
+        return Vec::new();
     }
     state.started = true;
-    let empty_usage = Usage::default();
-    let Some(s) = sender.as_mut() else {
-        return;
+    // The real usage arrives only with response.completed, which is after the
+    // stream: /usage reads the numbers from message_delta, but the context
+    // bar wants something at start — report the request estimates.
+    let start_usage = Usage {
+        input_tokens: state.fresh_est,
+        cache_read_input_tokens: state.cached_est,
+        ..Default::default()
     };
     let msg = json!({
         "type": "message_start",
@@ -1174,22 +1633,176 @@ async fn ensure_message_start(
             "model": original_model,
             "stop_reason": Value::Null,
             "stop_sequence": Value::Null,
-            "usage": build_usage_payload(original_model, &empty_usage),
+            "usage": build_usage_payload(original_model, &start_usage),
         },
     });
-    if s.send_data(Bytes::from(format_sse("message_start", &msg)))
-        .await
-        .is_err()
-    {
-        *sender = None;
-        return;
+    vec![
+        ("message_start".to_string(), msg),
+        ("ping".to_string(), json!({"type": "ping"})),
+    ]
+}
+
+/// Applies one upstream Responses event to the state machine and returns the
+/// Anthropic SSE events it produces (message_start/ping included when the
+/// stream has not started yet).
+fn process_upstream_event(
+    state: &mut StreamState,
+    evt: &Value,
+    original_model: &str,
+) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    match s(evt, "type") {
+        Some("response.completed") | Some("response.done") => {
+            let resp = evt.get("response").unwrap_or(evt);
+            // /usage accumulates input/cache from the final
+            // message_delta usage: the full usage is needed, not just
+            // output_tokens.
+            state.stream_usage = Some(extract_usage(resp.get("usage")));
+            state.resp_id = resp.get("id").and_then(|v| v.as_str()).map(String::from);
+        }
+        Some("response.output_item.added") => {
+            if let Some(item) = evt.get("item") {
+                let oi = u(evt, "output_index")
+                    .or_else(|| u(item, "index"))
+                    .unwrap_or(state.blocks.len());
+                if s(item, "type") == Some("function_call") {
+                    out.extend(message_start_events(state, original_model));
+                    let idx = state.open_block(oi, "tool_use");
+                    state.has_tool_use = true;
+                    let call_id = s(item, "call_id").unwrap_or("").to_string();
+                    let id = s(item, "id").unwrap_or("").to_string();
+                    let name = s(item, "name").unwrap_or("").to_string();
+                    out.push((
+                        "content_block_start".to_string(),
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": if call_id.is_empty() { id.clone() } else { call_id.clone() },
+                                "name": name,
+                                "input": {},
+                            },
+                        }),
+                    ));
+                    state.resp_tool_calls.insert(
+                        oi,
+                        ToolCallInfo {
+                            call_id: if call_id.is_empty() { id } else { call_id },
+                            name,
+                            args: String::new(),
+                        },
+                    );
+                }
+            }
+        }
+        Some("response.output_item.done") => {
+            let oi = u(evt, "output_index").or_else(|| evt.get("item").and_then(|i| u(i, "index")));
+            if let (Some(oi), Some(idx)) =
+                (oi, oi.and_then(|oi| state.blocks.get(&oi)).map(|b| b.idx))
+            {
+                state.close_block(Some(oi));
+                out.push((
+                    "content_block_stop".to_string(),
+                    json!({
+                        "type": "content_block_stop",
+                        "index": idx,
+                    }),
+                ));
+            }
+        }
+        Some("response.output_text.delta") => {
+            if let Some(delta) = s(evt, "delta") {
+                let oi = u(evt, "output_index").unwrap_or(0);
+                state
+                    .resp_texts
+                    .entry(oi)
+                    .and_modify(|t| t.push_str(delta))
+                    .or_insert_with(|| delta.to_string());
+                if !state.blocks.contains_key(&oi) {
+                    out.extend(message_start_events(state, original_model));
+                    let idx = state.open_block(oi, "text");
+                    out.push((
+                        "content_block_start".to_string(),
+                        json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": { "type": "text", "text": "" },
+                        }),
+                    ));
+                }
+                let idx = state.blocks.get(&oi).map(|b| b.idx).unwrap_or(0);
+                out.push((
+                    "content_block_delta".to_string(),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": { "type": "text_delta", "text": delta },
+                    }),
+                ));
+            }
+        }
+        Some("response.function_call_arguments.delta") => {
+            if let Some(delta) = s(evt, "delta") {
+                let oi = u(evt, "output_index").unwrap_or(0);
+                if let Some(tool) = state.resp_tool_calls.get_mut(&oi) {
+                    tool.args.push_str(delta);
+                }
+                if let Some(idx) = state.blocks.get(&oi).map(|b| b.idx) {
+                    out.push((
+                        "content_block_delta".to_string(),
+                        json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": { "type": "input_json_delta", "partial_json": delta },
+                        }),
+                    ));
+                }
+            }
+        }
+        Some("response.function_call_arguments.done") => {
+            let oi = u(evt, "output_index");
+            if let (Some(oi), Some(idx)) =
+                (oi, oi.and_then(|oi| state.blocks.get(&oi)).map(|b| b.idx))
+            {
+                state.close_block(Some(oi));
+                out.push((
+                    "content_block_stop".to_string(),
+                    json!({
+                        "type": "content_block_stop",
+                        "index": idx,
+                    }),
+                ));
+            }
+        }
+        _ => {}
     }
-    if s.send_data(Bytes::from(format_sse("ping", &json!({"type": "ping"}))))
-        .await
-        .is_err()
-    {
-        *sender = None;
+    out
+}
+
+type StreamSender = http_body_util::channel::Sender<Bytes>;
+
+/// Sends the Anthropic events produced for one upstream event. Returns false
+/// when the client is gone.
+async fn send_translated(
+    state: &mut StreamState,
+    evt: &Value,
+    original_model: &str,
+    sender: &mut Option<StreamSender>,
+) -> bool {
+    for (event, data) in process_upstream_event(state, evt, original_model) {
+        let Some(s) = sender.as_mut() else {
+            return false;
+        };
+        if s.send_data(Bytes::from(format_sse(&event, &data)))
+            .await
+            .is_err()
+        {
+            *sender = None; // client gone
+            return false;
+        }
     }
+    true
 }
 
 /// State needed to remember (or forget) a conversation for turn chaining.
@@ -1198,187 +1811,32 @@ struct ChainContext {
     linked: bool,
     input_items: Vec<Value>,
     props: String,
+    /// Estimated tokens of the request actually sent (delta when chained).
+    est_this: u64,
+    /// Estimated tokens of the reconnected context (previous turns).
+    cached_est: u64,
 }
 
-/// Writes the upstream Responses SSE stream to the client as Anthropic SSE.
-/// On client abort the upstream body is dropped.
-async fn stream_translation(
-    ctx: Shared,
-    upstream: reqwest::Response,
-    sender: http_body_util::channel::Sender<Bytes>,
+/// Stream tail shared by the HTTP and WebSocket paths: closes open blocks,
+/// remembers the conversation for chaining, logs the usage and emits
+/// message_delta + message_stop (or the empty-response sequence).
+async fn finalize_stream(
+    ctx: &Shared,
+    sender: &mut Option<StreamSender>,
+    state: &mut StreamState,
     original_model: &str,
     spec: &ModelSpec,
     chain: ChainContext,
 ) {
-    let mut state = StreamState::new();
-    let mut parser = SseParser::new();
-    let mut stream_usage: Option<Usage> = None;
-    let mut sender: Option<http_body_util::channel::Sender<Bytes>> = Some(sender);
-
     macro_rules! emit {
         ($event:expr, $data:expr) => {
             if let Some(s) = sender.as_mut() {
-                let bytes = Bytes::from(format_sse($event, &$data));
+                let bytes = Bytes::from(format_sse(&$event, &$data));
                 if s.send_data(bytes).await.is_err() {
-                    sender = None; // client gone: drop the upstream body
+                    *sender = None; // client gone
                 }
             }
         };
-    }
-
-    let mut chunks = upstream.bytes_stream();
-    loop {
-        let Some(Ok(chunk)) = chunks.next().await else {
-            break;
-        };
-        for line in parser.feed(&chunk) {
-            if sender.is_none() {
-                break;
-            }
-            if !line.starts_with(b"data: ") {
-                continue; // comments (": keep-alive") and blank lines
-            }
-            let payload = std::str::from_utf8(&line[6..]).unwrap_or("").trim();
-            if payload.is_empty() || payload == "[DONE]" {
-                continue;
-            }
-            let evt: Value = match serde_json::from_str(payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            match s(&evt, "type") {
-                Some("response.completed") | Some("response.done") => {
-                    let resp = evt.get("response").unwrap_or(&evt);
-                    // /usage accumulates input/cache from the final
-                    // message_delta usage: the full usage is needed, not just
-                    // output_tokens.
-                    stream_usage = Some(extract_usage(resp.get("usage")));
-                    state.resp_id = resp.get("id").and_then(|v| v.as_str()).map(String::from);
-                }
-                Some("response.output_item.added") => {
-                    if let Some(item) = evt.get("item") {
-                        let oi = u(&evt, "output_index")
-                            .or_else(|| u(item, "index"))
-                            .unwrap_or(state.blocks.len());
-                        if s(item, "type") == Some("function_call") {
-                            ensure_message_start(&mut state, original_model, &mut sender).await;
-                            let idx = state.open_block(oi, "tool_use");
-                            state.has_tool_use = true;
-                            let call_id = s(item, "call_id").unwrap_or("").to_string();
-                            let id = s(item, "id").unwrap_or("").to_string();
-                            let name = s(item, "name").unwrap_or("").to_string();
-                            emit!(
-                                "content_block_start",
-                                json!({
-                                    "type": "content_block_start",
-                                    "index": idx,
-                                    "content_block": {
-                                        "type": "tool_use",
-                                        "id": if call_id.is_empty() { id.clone() } else { call_id.clone() },
-                                        "name": name,
-                                        "input": {},
-                                    },
-                                })
-                            );
-                            state.resp_tool_calls.insert(
-                                oi,
-                                ToolCallInfo {
-                                    call_id: if call_id.is_empty() { id } else { call_id },
-                                    name,
-                                    args: String::new(),
-                                },
-                            );
-                        }
-                    }
-                }
-                Some("response.output_item.done") => {
-                    let oi = u(&evt, "output_index")
-                        .or_else(|| evt.get("item").and_then(|i| u(i, "index")));
-                    if let (Some(oi), Some(idx)) =
-                        (oi, oi.and_then(|oi| state.blocks.get(&oi)).map(|b| b.idx))
-                    {
-                        state.close_block(Some(oi));
-                        emit!(
-                            "content_block_stop",
-                            json!({
-                                "type": "content_block_stop",
-                                "index": idx,
-                            })
-                        );
-                    }
-                }
-                Some("response.output_text.delta") => {
-                    if let Some(delta) = s(&evt, "delta") {
-                        let oi = u(&evt, "output_index").unwrap_or(0);
-                        state
-                            .resp_texts
-                            .entry(oi)
-                            .and_modify(|t| t.push_str(delta))
-                            .or_insert_with(|| delta.to_string());
-                        if !state.blocks.contains_key(&oi) {
-                            ensure_message_start(&mut state, original_model, &mut sender).await;
-                            let idx = state.open_block(oi, "text");
-                            emit!(
-                                "content_block_start",
-                                json!({
-                                    "type": "content_block_start",
-                                    "index": idx,
-                                    "content_block": { "type": "text", "text": "" },
-                                })
-                            );
-                        }
-                        let idx = state.blocks.get(&oi).map(|b| b.idx).unwrap_or(0);
-                        emit!(
-                            "content_block_delta",
-                            json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": { "type": "text_delta", "text": delta },
-                            })
-                        );
-                    }
-                }
-                Some("response.function_call_arguments.delta") => {
-                    if let Some(delta) = s(&evt, "delta") {
-                        let oi = u(&evt, "output_index").unwrap_or(0);
-                        if let Some(tool) = state.resp_tool_calls.get_mut(&oi) {
-                            tool.args.push_str(delta);
-                        }
-                        let Some(idx) = state.blocks.get(&oi).map(|b| b.idx) else {
-                            continue;
-                        };
-                        emit!(
-                            "content_block_delta",
-                            json!({
-                                "type": "content_block_delta",
-                                "index": idx,
-                                "delta": { "type": "input_json_delta", "partial_json": delta },
-                            })
-                        );
-                    }
-                }
-                Some("response.function_call_arguments.done") => {
-                    let oi = u(&evt, "output_index");
-                    if let (Some(oi), Some(idx)) =
-                        (oi, oi.and_then(|oi| state.blocks.get(&oi)).map(|b| b.idx))
-                    {
-                        state.close_block(Some(oi));
-                        emit!(
-                            "content_block_stop",
-                            json!({
-                                "type": "content_block_stop",
-                                "index": idx,
-                            })
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        if sender.is_none() {
-            break;
-        }
     }
 
     // Close any block left open.
@@ -1430,11 +1888,19 @@ async fn stream_translation(
                     last_input: chain.input_items,
                     last_response_items: response_items,
                     props: chain.props,
+                    cumulative: chain.cached_est + chain.est_this,
                 },
             );
         }
     }
-    let su = stream_usage.unwrap_or_default();
+    let mut su = state.stream_usage.clone().unwrap_or_default();
+    // The backend does not count the reconnected context on chained turns
+    // (it reports cached=0): /usage would show the cache reads as zero even
+    // though the whole baseline is billed at cache rates. Report our own
+    // estimate of the baseline instead.
+    if chain.linked {
+        su.cache_read_input_tokens = su.cache_read_input_tokens.max(chain.cached_est);
+    }
     eprintln!(
         "[opencc] usage {}: in={} cached={} out={} ({})",
         spec.id,
@@ -1462,7 +1928,9 @@ async fn stream_translation(
             output_tokens: 0,
             ..Default::default()
         };
-        ensure_message_start(&mut state, original_model, &mut sender).await;
+        for (event, data) in message_start_events(state, original_model) {
+            emit!(event, data);
+        }
         emit!(
             "content_block_start",
             json!({
@@ -1487,6 +1955,112 @@ async fn stream_translation(
             })
         );
         emit!("message_stop", json!({ "type": "message_stop" }));
+    }
+}
+
+/// Writes the upstream Responses SSE stream to the client as Anthropic SSE.
+/// On client abort the upstream body is dropped.
+async fn stream_translation(
+    ctx: Shared,
+    upstream: reqwest::Response,
+    sender: StreamSender,
+    original_model: &str,
+    spec: &ModelSpec,
+    chain: ChainContext,
+) {
+    let mut state = StreamState::new();
+    state.fresh_est = chain.est_this;
+    state.cached_est = chain.cached_est;
+    let mut parser = SseParser::new();
+    let mut sender: Option<StreamSender> = Some(sender);
+
+    let mut chunks = upstream.bytes_stream();
+    'outer: loop {
+        let Some(Ok(chunk)) = chunks.next().await else {
+            break;
+        };
+        for line in parser.feed(&chunk) {
+            if sender.is_none() {
+                break 'outer;
+            }
+            if !line.starts_with(b"data: ") {
+                continue; // comments (": keep-alive") and blank lines
+            }
+            let payload = std::str::from_utf8(&line[6..]).unwrap_or("").trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            let evt: Value = match serde_json::from_str(payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !send_translated(&mut state, &evt, original_model, &mut sender).await {
+                break 'outer;
+            }
+        }
+        if sender.is_none() {
+            break;
+        }
+    }
+
+    finalize_stream(&ctx, &mut sender, &mut state, original_model, spec, chain).await;
+    drop(sender); // end of the stream body
+}
+
+/// WebSocket variant of [`stream_translation`]: consumes the events of one
+/// response from the shared connection. The receiver is returned to the
+/// session on success; on client abort the session is killed so the next
+/// request reconnects with a full resend.
+#[allow(clippy::too_many_arguments)] // internal plumbing: stream context
+async fn ws_stream_translation(
+    ctx: Shared,
+    key: String,
+    gen: u64,
+    first: Value,
+    mut rx: mpsc::Receiver<Value>,
+    sender: StreamSender,
+    original_model: &str,
+    spec: &ModelSpec,
+    chain: ChainContext,
+) {
+    let mut state = StreamState::new();
+    state.fresh_est = chain.est_this;
+    state.cached_est = chain.cached_est;
+    let mut sender: Option<StreamSender> = Some(sender);
+    let mut pending: Option<Value> = Some(first);
+    let mut aborted = false;
+    loop {
+        if sender.is_none() {
+            aborted = true;
+            break;
+        }
+        let evt = match pending.take() {
+            Some(v) => v,
+            None => match rx.recv().await {
+                Some(v) => v,
+                None => break,
+            },
+        };
+        // The connection stays open for the next request: stop consuming at
+        // the end of this response.
+        let terminal = matches!(
+            s(&evt, "type"),
+            Some("response.completed") | Some("response.done")
+        );
+        if !send_translated(&mut state, &evt, original_model, &mut sender).await {
+            aborted = true;
+            break;
+        }
+        if terminal {
+            break;
+        }
+    }
+    finalize_stream(&ctx, &mut sender, &mut state, original_model, spec, chain).await;
+    if aborted {
+        ctx.ws_sessions.kill(&key, gen);
+        ctx.conversations.forget(&key);
+    } else {
+        ctx.ws_sessions.release(&key, gen, rx);
     }
     drop(sender); // end of the stream body
 }
@@ -1664,6 +2238,23 @@ mod tests {
         assert_eq!(payload["total_input_tokens"], 120);
         assert_eq!(payload["context_window"], 950000);
         assert_eq!(payload["current_usage"]["cache_read_input_tokens"], 20);
+    }
+
+    #[test]
+    fn estimates_request_tokens() {
+        let req = json!({
+            "model": "gpt-two",
+            "instructions": "You are a helpful assistant.",
+            "input": [{"role": "user", "content": "hello"}],
+            "store": false,
+            "stream": true,
+        });
+        let est = estimate_request_tokens(&req);
+        // ~160 chars → ~40 tokens; must be nonzero and scale with size.
+        assert!(est > 0);
+        let big = json!({"input": [{"role": "user", "content": "x".repeat(10000)}]});
+        let big_est = estimate_request_tokens(&big);
+        assert!(big_est > est * 10);
     }
 
     #[test]

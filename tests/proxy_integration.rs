@@ -3,6 +3,7 @@
 //! by a local hyper server. Port of the node test suite
 //! (opencc-proxy.test.mjs).
 
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes;
 use hyper::service::service_fn;
@@ -784,4 +785,321 @@ fn chaining_sends_the_delta_and_falls_back_on_failure() {
     );
     assert_eq!(sent[1]["previous_response_id"], "resp_chain_1");
     drop(sent);
+}
+
+// ── Mock WebSocket upstream (subscription mode) ───────────────────────────────
+
+/// A WebSocket server that records every client frame and answers each with
+/// the frames returned by `handler` (per connection, in order).
+struct WsMockServer {
+    port: u16,
+    frames: Arc<Mutex<Vec<Value>>>,
+    connections: Arc<Mutex<usize>>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+fn start_ws_mock<F>(handler: F) -> WsMockServer
+where
+    F: Fn(&Value, usize) -> Vec<Value> + Send + Sync + 'static,
+{
+    let handler = Arc::new(handler);
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let connections: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let port: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+
+    let handler2 = handler.clone();
+    let frames2 = frames.clone();
+    let connections2 = connections.clone();
+    let port2 = port.clone();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            *port2.lock().unwrap() = Some(listener.local_addr().unwrap().port());
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                let handler = handler2.clone();
+                let frames = frames2.clone();
+                let connections = connections2.clone();
+                tokio::spawn(async move {
+                    let ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    let conn_idx = {
+                        let mut c = connections.lock().unwrap();
+                        *c += 1;
+                        *c
+                    };
+                    let (mut sink, mut stream) = ws.split();
+                    while let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                        stream.next().await
+                    {
+                        let Ok(evt) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        frames.lock().unwrap().push(evt.clone());
+                        for resp in handler(&evt, conn_idx) {
+                            if sink
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    resp.to_string().into(),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    });
+    for _ in 0..200 {
+        if let Some(p) = *port.lock().unwrap() {
+            return WsMockServer {
+                port: p,
+                frames,
+                connections,
+                _thread: thread,
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("ws mock server did not start");
+}
+
+/// A temp HOME with a fake codex auth.json (access_token "ws-token").
+fn ws_test_home(tag: &str) -> PathBuf {
+    let home = std::env::temp_dir().join(format!("opencc-ws-home-{}-{tag}", std::process::id()));
+    let codex = home.join(".codex");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("auth.json"),
+        serde_json::to_string(&json!({
+            "tokens": {
+                "access_token": "ws-token",
+                "refresh_token": "rt-1",
+                "account_id": "acc-1",
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    home
+}
+
+fn ws_proxy_env(home: &std::path::Path, upstream_port: u16) -> Vec<(&'static str, String)> {
+    let mut envs = home_env(home);
+    envs.push(("OPENCC_MODE", "subscription".into()));
+    envs.push((
+        "CHATGPT_API_BASE",
+        format!("http://127.0.0.1:{upstream_port}"),
+    ));
+    envs
+}
+
+#[test]
+fn subscription_chains_turns_over_websocket() {
+    let mock = start_ws_mock(move |frame: &Value, _conn: usize| {
+        if frame.get("previous_response_id").is_some() {
+            vec![
+                json!({"type": "response.output_text.delta", "delta": "second"}),
+                json!({"type": "response.completed", "response": {"id": "resp_ws_2", "usage": {"input_tokens": 4, "output_tokens": 1}}}),
+            ]
+        } else {
+            vec![
+                json!({"type": "response.output_text.delta", "delta": "first"}),
+                json!({"type": "response.completed", "response": {"id": "resp_ws_1", "usage": {"input_tokens": 3, "output_tokens": 1}}}),
+            ]
+        }
+    });
+    let home = ws_test_home("chain");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let c = client();
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-{}", std::process::id());
+    let send = |messages: Value| {
+        c.post(format!("{base}/v1/messages"))
+            .header("x-claude-code-session-id", session.as_str())
+            .json(&json!({"model": "gpt-two", "messages": messages, "stream": true}))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap()
+    };
+
+    let first = send(json!([{"role": "user", "content": "hello"}]));
+    assert!(first.contains("first"));
+    let second = send(json!([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "and then?"},
+    ]));
+    assert!(second.contains("second"));
+
+    // /usage reads the final numbers from message_delta: turn 1 reports the
+    // real input (3) with no cache; the chained turn 2 keeps the real delta
+    // input (4) and reports the reconnected baseline as cache read.
+    let first_events = parse_sse(&first);
+    let first_delta = first_events
+        .iter()
+        .find(|(e, _)| e == "message_delta")
+        .map(|(_, d)| d.clone())
+        .unwrap();
+    assert_eq!(first_delta["usage"]["input_tokens"], 3);
+    assert_eq!(
+        first_delta["usage"]["current_usage"]["cache_read_input_tokens"],
+        0
+    );
+
+    let second_events = parse_sse(&second);
+    let second_delta = second_events
+        .iter()
+        .find(|(e, _)| e == "message_delta")
+        .map(|(_, d)| d.clone())
+        .unwrap();
+    assert_eq!(second_delta["usage"]["input_tokens"], 4);
+    let cache_read = second_delta["usage"]["current_usage"]["cache_read_input_tokens"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        cache_read > 0,
+        "chained turn must report the reconnected baseline as cache read"
+    );
+
+    let frames = mock.frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        *mock.connections.lock().unwrap(),
+        1,
+        "one connection reused"
+    );
+    assert_eq!(frames[0]["type"], "response.create");
+    assert_eq!(frames[0]["input"].as_array().unwrap().len(), 1);
+    assert!(frames[0].get("previous_response_id").is_none());
+    // Turn 2: only the delta goes up, with the chain id.
+    assert_eq!(frames[1]["previous_response_id"], "resp_ws_1");
+    assert_eq!(frames[1]["input"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        frames[1]["input"][0],
+        json!({"role": "user", "content": "and then?"})
+    );
+    drop(frames);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn subscription_ws_error_reconnects_with_the_full_input() {
+    let mock = start_ws_mock(move |frame: &Value, conn: usize| {
+        let chained = frame.get("previous_response_id").is_some();
+        if conn == 1 && chained {
+            // The backend rejects the stale chain: error frame.
+            vec![json!({
+                "type": "error", "status": 400,
+                "error": {"type": "invalid_request_error", "message": "Invalid `previous_response_id`."}
+            })]
+        } else if conn == 1 {
+            vec![
+                json!({"type": "response.output_text.delta", "delta": "first"}),
+                json!({"type": "response.completed", "response": {"id": "resp_ws_1", "usage": {"input_tokens": 3, "output_tokens": 1}}}),
+            ]
+        } else {
+            vec![
+                json!({"type": "response.output_text.delta", "delta": "second"}),
+                json!({"type": "response.completed", "response": {"id": "resp_ws_2", "usage": {"input_tokens": 4, "output_tokens": 1}}}),
+            ]
+        }
+    });
+    let home = ws_test_home("error");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let c = client();
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-{}", std::process::id());
+    let send = |messages: Value| {
+        c.post(format!("{base}/v1/messages"))
+            .header("x-claude-code-session-id", session.as_str())
+            .json(&json!({"model": "gpt-two", "messages": messages, "stream": true}))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap()
+    };
+
+    let first = send(json!([{"role": "user", "content": "hello"}]));
+    assert!(first.contains("first"));
+    // The chained attempt fails; the proxy reconnects and resends the full
+    // input, so the client still sees a complete stream.
+    let second = send(json!([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "and then?"},
+    ]));
+    assert!(second.contains("second"));
+
+    let frames = mock.frames.lock().unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(*mock.connections.lock().unwrap(), 2, "reconnected");
+    assert!(frames[1].get("previous_response_id").is_some());
+    // The retry sends the FULL input (3 items), no chaining.
+    assert_eq!(frames[2]["input"].as_array().unwrap().len(), 3);
+    assert!(frames[2].get("previous_response_id").is_none());
+    drop(frames);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn subscription_falls_back_to_http_when_websocket_is_unavailable() {
+    // The upstream mock only speaks HTTP: the WS upgrade fails, so the proxy
+    // must fall back to a plain HTTP full request (no chaining attempts).
+    let mock = start_mock(|_req| {
+        MockResponse::sse(
+            200,
+            &[
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"via-http\"}",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_1\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}",
+                "",
+            ],
+        )
+    });
+    let home = ws_test_home("fallback");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let c = client();
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-{}", std::process::id());
+
+    let resp = c
+        .post(format!("{base}/v1/messages"))
+        .header("x-claude-code-session-id", session.as_str())
+        .json(&json!({
+            "model": "gpt-two",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        }))
+        .send()
+        .unwrap();
+    let text = resp.text().unwrap();
+    assert!(text.contains("via-http"));
+
+    let requests = mock.requests.lock().unwrap();
+    // The WS upgrade attempt is recorded too; only the real call counts.
+    let responses_calls: Vec<&MockRequest> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path == "/responses")
+        .collect();
+    assert_eq!(responses_calls.len(), 1);
+    assert!(responses_calls[0]
+        .json()
+        .get("previous_response_id")
+        .is_none());
+    drop(requests);
+    let _ = std::fs::remove_dir_all(&home);
 }

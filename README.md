@@ -192,23 +192,29 @@ OpenAI backends speak the Responses protocol: `opencc-proxy` is a local proxy
   model's policy (see above). `ultra` is not accepted by `--effort`/`/effort`
   (it would be silently ignored), so it stays encoded in the model as
   `model@ultra`, a format the proxy recognizes.
-- **Turn chaining (input savings):** the proxy never resends the full history
-  like codex does: if the new request of the same session is an extension of
-  the previous one, it sends **only the delta** with `previous_response_id`;
-  the backend reconnects the context and bills the repeated part at cache
-  rates. If chaining fails (expired response, changed context), the proxy
-  automatically retries with the full request. The log records every request:
-  `[opencc] delta sess-1|: 1 items sent (baseline 2)` and
+- **Turn chaining (input savings):** like codex, the proxy never resends the
+  full history: if the new request of the same session is an extension of the
+  previous one, it sends **only the delta** with `previous_response_id` and
+  the backend reconnects the previous context at cache rates. The ChatGPT
+  backend only supports this over its **WebSocket** channel (the HTTP
+  endpoint rejects `previous_response_id`), so in subscription mode the proxy
+  keeps one WebSocket connection per conversation; if it fails (stale chain,
+  connection limit, network), the proxy reconnects and automatically retries
+  with the full request. The `apikey` mode chains over plain HTTP instead.
+  The log records every request: `[opencc] delta sess-1|: 1 items sent
+  (baseline 2)` and
   `[opencc] usage gpt-5.6-sol: in=... cached=... out=... (delta|full)`.
-- **`/usage`:** the tokens (input/output) shown by `/usage` are the real ones
-  from the OpenAI backend: the proxy converts
-  `input_tokens_details.cached_tokens` into `cache_read_input_tokens` and
-  subtracts it from `input_tokens`, per Anthropic convention. Two limits: the
-  **cache read/write** columns show 0 (the Responses API only reports usage at
-  the end of the stream, while Claude Code reads the cache from
-  `message_start`), and the **cost** is a Claude Code estimate for unknown
-  models, marked `costs may be inaccurate due to usage of unknown models` —
-  it is not possible to inject provider pricing.
+- **`/usage`:** the tokens shown by `/usage` are the real ones from the
+  OpenAI backend (input = fresh tokens, cache read = the reconnected
+  context): the proxy converts `input_tokens_details.cached_tokens` into
+  `cache_read_input_tokens` and subtracts it from `input_tokens`, per
+  Anthropic convention. The ChatGPT backend does not count the context it
+  reconnects on chained turns (`cached_tokens: 0`), so for chained requests
+  the proxy reports its own estimate of the baseline as
+  `cache_read_input_tokens` (tracked per conversation, chars/4 heuristic).
+  The **cost** is a Claude Code estimate for unknown models, marked
+  `costs may be inaccurate due to usage of unknown models` — it is not
+  possible to inject provider pricing.
 
 ## `opencode` backend
 
