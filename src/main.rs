@@ -588,7 +588,10 @@ fn spawn_and_propagate(mut cmd: Command, cleanup: Option<&Cleanup>) -> ExitCode 
         }
     };
     let status = child.wait();
+    #[cfg(unix)]
     let interrupted = crate::signals::interrupted_signal();
+    #[cfg(not(unix))]
+    let interrupted = None;
     if let Some(cleanup) = cleanup {
         cleanup.run();
     }

@@ -113,7 +113,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: draft release v${{ env.VERSION }}
+    # The env context is not available in job-level expressions, so the
+    # version can't appear here — it's computed in a step below and shown in
+    # the release title instead.
+    name: draft release
     needs: [build, build-macos]
     runs-on: ubuntu-latest
     steps:
