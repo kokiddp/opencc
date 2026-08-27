@@ -52,7 +52,7 @@ jobs:
           TARGET: ${{ matrix.target }}
       - uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: 0.15.1
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
