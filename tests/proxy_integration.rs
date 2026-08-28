@@ -848,6 +848,12 @@ where
                         };
                         frames.lock().unwrap().push(evt.clone());
                         for resp in handler(&evt, conn_idx) {
+                            // Sentinel: drop the connection instead of
+                            // sending, to simulate an upstream that dies
+                            // mid-response.
+                            if resp.get("type").and_then(|t| t.as_str()) == Some("__close__") {
+                                return;
+                            }
                             if sink
                                 .send(tokio_tungstenite::tungstenite::Message::Text(
                                     resp.to_string().into(),
@@ -1146,5 +1152,231 @@ fn subscription_ws_failure_is_relayed_as_an_error_event() {
     let frames = mock.frames.lock().unwrap();
     assert_eq!(frames.len(), 1);
     drop(frames);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The upstream dying mid-response must surface as an error, and must not
+/// leave the dead connection in the pool or a stale chain id behind.
+///
+/// Regression: the reader task ending was treated as a clean end of stream.
+/// The turn became a well-formed *empty* assistant message (Claude Code
+/// retried it silently, forever), the dead receiver went back into the
+/// session pool for the next turn to wedge on, and the unusable
+/// previous_response_id was kept — so the retry chained onto it, was
+/// rejected, and paid a full resend to find out.
+#[test]
+fn subscription_ws_drop_mid_response_fails_the_turn_and_resets_the_chain() {
+    let mock = start_ws_mock(move |frame: &Value, conn: usize| {
+        if conn == 1 {
+            // First connection: start the response, then vanish.
+            vec![
+                json!({"type": "response.output_text.delta", "delta": "partial"}),
+                json!({"type": "__close__"}),
+            ]
+        } else {
+            assert!(
+                frame.get("previous_response_id").is_none(),
+                "after a dropped response the next turn must not chain onto it"
+            );
+            vec![
+                json!({"type": "response.output_text.delta", "delta": "recovered"}),
+                json!({"type": "response.completed", "response": {"id": "resp_ws_ok", "usage": {"input_tokens": 5, "output_tokens": 1}}}),
+            ]
+        }
+    });
+    let home = ws_test_home("wsdrop");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let c = client();
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-drop-{}", std::process::id());
+    let send = |messages: Value| {
+        c.post(format!("{base}/v1/messages"))
+            .header("x-claude-code-session-id", session.as_str())
+            .json(&json!({"model": "gpt-two", "messages": messages, "stream": true}))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap()
+    };
+
+    let first = send(json!([{"role": "user", "content": "hello"}]));
+    let first_events = parse_sse(&first);
+    assert!(
+        first_events.iter().any(|(e, _)| e == "error"),
+        "a dropped response must be reported as an error, not as an empty turn: {first}"
+    );
+
+    // The next turn must reconnect and send the full input (asserted in the
+    // handler above), and must succeed.
+    let second = send(json!([
+        {"role": "user", "content": "hello"},
+        {"role": "user", "content": "again"},
+    ]));
+    assert!(second.contains("recovered"), "{second}");
+    let second_events = parse_sse(&second);
+    assert!(
+        !second_events.iter().any(|(e, _)| e == "error"),
+        "the recovery turn must succeed: {second}"
+    );
+
+    let frames = mock.frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[1]["input"].as_array().unwrap().len(),
+        2,
+        "the recovery turn resends the full input"
+    );
+    drop(frames);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Many agents at once: each gets its own upstream session and chains on it,
+/// with no interference between them. This is the workload the proxy exists
+/// for — subagents fanning out — and the one that used to degrade worst.
+#[test]
+fn concurrent_agents_each_chain_on_their_own_session() {
+    let mock = start_ws_mock(move |frame: &Value, conn: usize| {
+        let chained = frame.get("previous_response_id").is_some();
+        let text = if chained { "second" } else { "first" };
+        vec![
+            json!({"type": "response.output_text.delta", "delta": text}),
+            json!({"type": "response.completed", "response": {
+                "id": format!("resp_{conn}_{text}"),
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            }}),
+        ]
+    });
+    let home = ws_test_home("wsagents");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-agents-{}", std::process::id());
+
+    const AGENTS: usize = 8;
+    let handles: Vec<_> = (0..AGENTS)
+        .map(|i| {
+            let base = base.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let c = client();
+                let agent = format!("agent-{i}");
+                let send = |messages: Value| {
+                    c.post(format!("{base}/v1/messages"))
+                        .header("x-claude-code-session-id", session.as_str())
+                        .header("x-claude-code-agent-id", agent.as_str())
+                        .json(&json!({"model": "gpt-two", "messages": messages, "stream": true}))
+                        .send()
+                        .unwrap()
+                        .text()
+                        .unwrap()
+                };
+                let first = send(json!([{"role": "user", "content": "hello"}]));
+                let second = send(json!([
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "first"},
+                    {"role": "user", "content": "and then?"},
+                ]));
+                (first, second)
+            })
+        })
+        .collect();
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let (first, second) = h.join().unwrap();
+        for (turn, body) in [("first", &first), ("second", &second)] {
+            let events = parse_sse(body);
+            assert!(
+                !events.iter().any(|(e, _)| e == "error"),
+                "agent {i} {turn} turn errored: {body}"
+            );
+            assert!(
+                events.iter().any(|(e, _)| e == "message_stop"),
+                "agent {i} {turn} turn did not complete: {body}"
+            );
+        }
+        assert!(second.contains("second"), "agent {i} second turn: {second}");
+    }
+
+    // One connection per agent, and every agent's second turn chained: no
+    // agent was knocked off its session by another.
+    assert_eq!(
+        *mock.connections.lock().unwrap(),
+        AGENTS,
+        "each agent must get exactly one upstream session"
+    );
+    let frames = mock.frames.lock().unwrap();
+    assert_eq!(frames.len(), AGENTS * 2);
+    let chained = frames
+        .iter()
+        .filter(|f| f.get("previous_response_id").is_some())
+        .count();
+    assert_eq!(
+        chained, AGENTS,
+        "every agent's second turn must chain instead of resending"
+    );
+    drop(frames);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two turns racing on one key must not tear each other's session down: the
+/// second waits for the connection and chains onto it.
+///
+/// Regression: `acquire` handed out the connection without marking it in
+/// flight, so a turn arriving in that window removed the entry from under the
+/// turn already using it. Both fell back to a full resend, and in the worst
+/// interleaving one turn wrote to one socket while reading from another.
+#[test]
+fn overlapping_turns_on_one_key_share_one_session() {
+    let mock = start_ws_mock(move |_frame: &Value, conn: usize| {
+        vec![
+            json!({"type": "response.output_text.delta", "delta": format!("conn{conn}")}),
+            json!({"type": "response.completed", "response": {
+                "id": format!("resp_{conn}"),
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            }}),
+        ]
+    });
+    let home = ws_test_home("wsrace");
+    let fixture = spawn_proxy(&ws_proxy_env(&home, mock.port));
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+    let session = format!("sess-race-{}", std::process::id());
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let base = base.clone();
+            let session = session.clone();
+            std::thread::spawn(move || {
+                client()
+                    .post(format!("{base}/v1/messages"))
+                    .header("x-claude-code-session-id", session.as_str())
+                    .json(&json!({
+                        "model": "gpt-two",
+                        "messages": [{"role": "user", "content": format!("turn {i}")}],
+                        "stream": true,
+                    }))
+                    .send()
+                    .unwrap()
+                    .text()
+                    .unwrap()
+            })
+        })
+        .collect();
+
+    for (i, h) in handles.into_iter().enumerate() {
+        let body = h.join().unwrap();
+        let events = parse_sse(&body);
+        assert!(
+            !events.iter().any(|(e, _)| e == "error"),
+            "turn {i} errored: {body}"
+        );
+        assert!(
+            events.iter().any(|(e, _)| e == "message_stop"),
+            "turn {i} did not complete: {body}"
+        );
+    }
+    assert_eq!(
+        *mock.connections.lock().unwrap(),
+        1,
+        "the racing turn must wait for the session, not open a second one"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WsMessage};
 
@@ -569,20 +571,52 @@ struct ConvState {
     cumulative: u64,
 }
 
+/// Conversations kept for chaining. Each entry retains the full input items
+/// of the last turn (every tool result verbatim), so an unbounded store grows
+/// with every agent spawned and never shrinks. Cap it: a conversation past
+/// the cap is one nobody is chaining onto any more.
+const MAX_CONVERSATIONS: usize = 64;
+
+/// A conversation untouched for this long is dropped. Claude Code will have
+/// moved on; keeping it only holds its input items in memory.
+const CONVERSATION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Default)]
 struct ConversationStore {
-    map: Mutex<HashMap<String, ConvState>>,
+    map: Mutex<HashMap<String, (ConvState, Instant)>>,
 }
 
 impl ConversationStore {
     fn get(&self, key: &str) -> Option<ConvState> {
-        self.map.lock().unwrap().get(key).cloned()
+        let mut map = self.map.lock().unwrap();
+        let entry = map.get_mut(key)?;
+        entry.1 = Instant::now();
+        Some(entry.0.clone())
     }
     fn remember(&self, key: &str, state: ConvState) {
-        self.map.lock().unwrap().insert(key.to_string(), state);
+        let mut map = self.map.lock().unwrap();
+        map.insert(key.to_string(), (state, Instant::now()));
+        Self::prune(&mut map);
     }
     fn forget(&self, key: &str) {
         self.map.lock().unwrap().remove(key);
+    }
+
+    /// Drops idle conversations, then the least-recently-used ones until the
+    /// store is back under the cap.
+    fn prune(map: &mut HashMap<String, (ConvState, Instant)>) {
+        let now = Instant::now();
+        map.retain(|_, (_, seen)| now.duration_since(*seen) < CONVERSATION_IDLE_TIMEOUT);
+        while map.len() > MAX_CONVERSATIONS {
+            let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&oldest);
+        }
     }
 }
 
@@ -642,18 +676,57 @@ struct WsEntry {
     gen: u64,
     /// Set while a request streams on this connection.
     in_flight: bool,
+    /// When this session last carried a turn, for idle eviction.
+    last_used: Instant,
+}
+
+/// Live upstream WebSocket sessions kept at once. Every agent holds one for
+/// the length of its conversation, and the backend caps concurrent
+/// connections per account: without a cap here, spawning agents eventually
+/// gets new connections rejected, and every rejection costs a full resend to
+/// discover. Evicting the coldest session instead is far cheaper — it only
+/// forfeits chaining for an agent that has gone quiet.
+const MAX_WS_SESSIONS: usize = 24;
+
+/// A session with no turn for this long is dropped. The backend closes idle
+/// connections on its own; discovering that lazily costs a wedged turn.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Upper bound on how long one turn may hold a session before it is assumed
+/// leaked. Well past any real turn: this only reclaims connections whose
+/// streaming task died without releasing them.
+const WS_STUCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How long a turn waits for a busy session before giving up on chaining.
+/// Sized for the handover between two turns of the same agent, not for a
+/// whole turn: past this it is cheaper to resend than to keep waiting.
+const WS_BUSY_WAIT: Duration = Duration::from_secs(2);
+const WS_BUSY_POLL: Duration = Duration::from_millis(25);
+
+/// All session bookkeeping under one lock. `connecting` reserves a key while
+/// its socket is being dialled, so two turns starting at once on a cold key
+/// open one connection rather than racing to open two — the loser of that
+/// race used to fall back to a full resend.
+#[derive(Default)]
+struct WsState {
+    map: HashMap<String, WsEntry>,
+    connecting: std::collections::HashSet<String>,
+    next_gen: u64,
 }
 
 #[derive(Default)]
 struct WsSessions {
-    map: Mutex<HashMap<String, WsEntry>>,
-    next_gen: Mutex<u64>,
+    state: Mutex<WsState>,
 }
 
 impl WsSessions {
-    /// Returns (writer lock guard, generation, event receiver) for `key`,
-    /// connecting a fresh session when none exists. `None` if the connection
-    /// could not be established.
+    /// Claims the connection for `key` for the length of one turn, connecting
+    /// a fresh session when none exists. The entry is marked in-flight before
+    /// the lock is released, so the claim is atomic: a caller that gets a
+    /// `WsAcquired` owns the connection until it calls `release` or `kill`.
+    ///
+    /// `None` means "do not use the WebSocket for this turn": another turn
+    /// holds the connection, or it could not be established.
     async fn acquire(
         &self,
         key: &str,
@@ -661,52 +734,119 @@ impl WsSessions {
         token: &str,
         account_id: &Option<String>,
     ) -> Option<WsAcquired> {
-        {
-            let mut map = self.map.lock().unwrap();
-            if let Some(entry) = map.get_mut(key) {
-                if !entry.in_flight {
-                    if let Some(rx) = entry.rx.take() {
-                        return Some(WsAcquired {
-                            writer: entry.writer.clone(),
-                            rx,
-                            gen: entry.gen,
-                        });
-                    }
+        // A turn already streaming on this key is almost always the previous
+        // turn of the same agent, about to finish. Waiting briefly for it
+        // keeps this turn chained; giving up at once would resend the whole
+        // conversation at full input rate to say the same thing.
+        let deadline = Instant::now() + WS_BUSY_WAIT;
+        let gen = loop {
+            {
+                let mut st = self.state.lock().unwrap();
+                Self::evict_idle(&mut st.map);
+                if let Some(acquired) = Self::claim(&mut st.map, key) {
+                    return Some(acquired);
                 }
-                // In-flight or receiver missing (connection torn down): drop
-                // the entry so we reconnect below.
-                map.remove(key);
+                // Busy means either a turn is streaming on the session or
+                // another turn is dialling one for this key. Both end soon;
+                // wait rather than open a second connection.
+                let streaming = st.map.get(key).is_some_and(|e| e.in_flight);
+                if !streaming && !st.connecting.contains(key) {
+                    // Any entry still here is dead — not in flight, yet
+                    // missing its receiver. Drop it and dial a replacement,
+                    // reserving the key so no one else dials in parallel.
+                    st.map.remove(key);
+                    st.connecting.insert(key.to_string());
+                    st.next_gen += 1;
+                    break st.next_gen;
+                }
             }
-        }
-        let gen = {
-            let mut g = self.next_gen.lock().unwrap();
-            *g += 1;
-            *g
+            if Instant::now() >= deadline {
+                return None; // still busy: this turn goes unchained
+            }
+            tokio::time::sleep(WS_BUSY_POLL).await;
         };
-        let (writer, rx, abort_tx) = ws_connect(config, token, account_id).await?;
-        let mut map = self.map.lock().unwrap();
-        let entry = map.entry(key.to_string()).or_insert(WsEntry {
-            writer,
-            rx: None,
-            _abort: abort_tx,
-            gen,
-            in_flight: false,
-        });
-        entry.gen = gen;
+
+        let dialled = ws_connect(config, token, account_id).await;
+
+        let mut st = self.state.lock().unwrap();
+        st.connecting.remove(key);
+        let (writer, rx, abort_tx) = dialled?;
+        Self::evict_idle(&mut st.map);
+        Self::make_room(&mut st.map);
+        st.map.insert(
+            key.to_string(),
+            WsEntry {
+                writer: writer.clone(),
+                rx: None,
+                _abort: abort_tx,
+                gen,
+                in_flight: true,
+                last_used: Instant::now(),
+            },
+        );
+        Some(WsAcquired { writer, rx, gen })
+    }
+
+    /// Takes the receiver of an idle live entry and marks it in flight.
+    fn claim(map: &mut HashMap<String, WsEntry>, key: &str) -> Option<WsAcquired> {
+        let entry = map.get_mut(key)?;
+        if entry.in_flight {
+            return None;
+        }
+        let rx = entry.rx.take()?;
+        entry.in_flight = true;
+        entry.last_used = Instant::now();
         Some(WsAcquired {
             writer: entry.writer.clone(),
             rx,
-            gen,
+            gen: entry.gen,
         })
+    }
+
+    /// Drops sessions that have carried no turn recently.
+    fn evict_idle(map: &mut HashMap<String, WsEntry>) {
+        let now = Instant::now();
+        map.retain(|_, e| {
+            let idle = now.duration_since(e.last_used);
+            if e.in_flight {
+                // A turn holding the connection for longer than any turn can
+                // plausibly run has leaked it (its task died without
+                // releasing). Reaping it costs that turn nothing — it owns
+                // the socket directly — and stops one lost task from
+                // blocking the key, and the session cap, forever.
+                idle < WS_STUCK_TIMEOUT
+            } else {
+                idle < WS_IDLE_TIMEOUT
+            }
+        });
+    }
+
+    /// Makes room for one more session by dropping the coldest idle one.
+    fn make_room(map: &mut HashMap<String, WsEntry>) {
+        while map.len() >= MAX_WS_SESSIONS {
+            let Some(coldest) = map
+                .iter()
+                .filter(|(_, e)| !e.in_flight)
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break; // everything is streaming: let the map exceed the cap
+            };
+            map.remove(&coldest);
+        }
     }
 
     /// Marks the streaming request finished: puts the receiver back and
     /// clears the in-flight flag, unless the entry was replaced meanwhile.
+    /// Only call this for a connection still known to be healthy — a dead
+    /// receiver put back here is handed to the next turn, which then wedges
+    /// on it and pays a full resend to find out.
     fn release(&self, key: &str, gen: u64, rx: mpsc::Receiver<Value>) {
-        let mut map = self.map.lock().unwrap();
-        if let Some(entry) = map.get_mut(key) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(entry) = st.map.get_mut(key) {
             if entry.gen == gen {
                 entry.in_flight = false;
+                entry.last_used = Instant::now();
                 entry.rx = Some(rx);
             }
         }
@@ -715,10 +855,10 @@ impl WsSessions {
     /// Marks the session dead (client abort, fatal error): the connection is
     /// dropped and the next request reconnects with a full resend.
     fn kill(&self, key: &str, gen: u64) {
-        let mut map = self.map.lock().unwrap();
-        if let Some(entry) = map.get(key) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(entry) = st.map.get(key) {
             if entry.gen == gen {
-                map.remove(key);
+                st.map.remove(key);
             }
         }
     }
@@ -845,13 +985,27 @@ struct ServerCtx {
     conversations: ConversationStore,
     ws_sessions: WsSessions,
     client: reqwest::Client,
+    /// Cleared for the process if the upstream ever rejects
+    /// `prompt_cache_key`. The ChatGPT backend is stricter about unknown
+    /// parameters than the public API, so the flag is discovered rather than
+    /// assumed.
+    send_cache_key: AtomicBool,
 }
 
 pub async fn run(config: Config) -> Result<(), std::io::Error> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        // Per-read, not per-request: a long stream is fine, a stalled one is
+        // not. Without this a wedged upstream pins the turn forever.
+        .read_timeout(Duration::from_secs(120))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let ctx = Arc::new(ServerCtx {
         conversations: ConversationStore::default(),
         ws_sessions: WsSessions::default(),
-        client: reqwest::Client::new(),
+        client,
+        send_cache_key: AtomicBool::new(true),
         config,
     });
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", ctx.config.port)).await?;
@@ -861,7 +1015,17 @@ pub async fn run(config: Config) -> Result<(), std::io::Error> {
     );
     eprintln!("[opencc-proxy] upstream={}", ctx.config.api_base);
     loop {
-        let (stream, _) = listener.accept().await?;
+        // A failed accept (fd exhaustion under many agents, a connection
+        // reset during the handshake) is transient. Returning here would
+        // take the whole proxy down and strand every running agent.
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("[opencc-proxy] accept error: {err}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -1114,21 +1278,9 @@ async fn ws_attempt(
     else {
         return WsAttempt::Fallback;
     };
+    // `acquire` already marked the entry in flight: this turn owns the
+    // connection until it releases or kills it.
     let gen = acquired.gen;
-
-    // Exclusive use of the connection while this response streams.
-    {
-        let mut map = ctx.ws_sessions.map.lock().unwrap();
-        match map.get_mut(key) {
-            Some(entry) if entry.gen == gen => {
-                if entry.in_flight {
-                    return WsAttempt::Fallback; // concurrent request on the key
-                }
-                entry.in_flight = true;
-            }
-            _ => return WsAttempt::Fallback, // replaced while connecting
-        }
-    }
 
     let mut frame = responses_req.clone();
     frame["type"] = json!("response.create");
@@ -1334,8 +1486,12 @@ async fn handle_openai(
         .cloned()
         .unwrap_or_default();
     let props = canonical_props(&normalized, &spec);
+    // The model is part of the key: a conversation cannot chain across
+    // models anyway (it is in `props`), and without it Claude Code's small
+    // background calls would contend with the main agent for the same
+    // WebSocket session and knock it out of chaining.
     let key = if is_stream {
-        session_key(&headers)
+        session_key(&headers).map(|k| format!("{k}|{}", spec.id))
     } else {
         None
     };
@@ -1413,39 +1569,40 @@ async fn handle_openai(
         }
     }
 
-    let do_fetch = |token: &str, account_id: &Option<String>| {
+    // This is the unchained path: the whole conversation is resent every
+    // turn, so the upstream prompt cache is the only thing keeping it cheap.
+    // `prompt_cache_key` routes turns that share a prefix to the same cache;
+    // without it the measured hit rate on this path is under 10%.
+    if let Some(k) = &key {
+        if ctx.send_cache_key.load(Ordering::Relaxed) {
+            responses_req["prompt_cache_key"] = json!(format!("opencc-{k}"));
+        }
+    }
+
+    let fetch = |req: &Value, token: &str, account_id: &Option<String>| {
         let mut builder = ctx
             .client
             .post(format!("{}/responses", ctx.config.api_base))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {token}"))
-            .json(&responses_req);
+            .json(req);
         if let Some(aid) = account_id {
             builder = builder.header("ChatGPT-Account-ID", aid);
         }
         builder
     };
 
-    let full_fetch = |token: &str, account_id: &Option<String>| {
-        // Retry without chaining: full input and no previous_response_id.
-        let mut full_req = responses_req.clone();
+    // Retry without chaining: full input and no previous_response_id.
+    let full_request = |req: &Value| {
+        let mut full_req = req.clone();
         full_req
             .as_object_mut()
             .map(|o| o.remove("previous_response_id"));
         full_req["input"] = json!(input_items);
-        let mut builder = ctx
-            .client
-            .post(format!("{}/responses", ctx.config.api_base))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&full_req);
-        if let Some(aid) = account_id {
-            builder = builder.header("ChatGPT-Account-ID", aid);
-        }
-        builder
+        full_req
     };
 
-    let mut upstream = match do_fetch(&token, &account_id).send().await {
+    let mut upstream = match fetch(&responses_req, &token, &account_id).send().await {
         Ok(r) => r,
         Err(err) => {
             return json_response(
@@ -1463,7 +1620,7 @@ async fn handle_openai(
                 refresh_auth(&ctx.config, &auth_file, &ctx.client).await
             {
                 auth = (fresh, fresh_account);
-                upstream = match do_fetch(&auth.0, &auth.1).send().await {
+                upstream = match fetch(&responses_req, &auth.0, &auth.1).send().await {
                     Ok(r) => r,
                     Err(err) => {
                         return json_response(
@@ -1476,6 +1633,40 @@ async fn handle_openai(
             }
         }
     }
+    // `prompt_cache_key` is documented for the public API; the ChatGPT
+    // backend is stricter about parameters it does not know. Discover that
+    // once from the rejection rather than assuming either way, then stop
+    // sending it for the rest of the process.
+    if upstream.status() == StatusCode::BAD_REQUEST
+        && responses_req.get("prompt_cache_key").is_some()
+    {
+        let err_text = upstream.text().await.unwrap_or_default();
+        if err_text.contains("prompt_cache_key") {
+            eprintln!("[opencc] upstream rejected prompt_cache_key: disabling it");
+            ctx.send_cache_key.store(false, Ordering::Relaxed);
+            responses_req
+                .as_object_mut()
+                .map(|o| o.remove("prompt_cache_key"));
+            upstream = match fetch(&responses_req, &auth.0, &auth.1).send().await {
+                Ok(r) => r,
+                Err(err) => {
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        &json!({"error": {"message": format!("Upstream error: {err}")}}),
+                    )
+                    .await;
+                }
+            };
+        } else {
+            // An unrelated 400: report it as the normal error path would.
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": {"message": upstream_error_message(&err_text)}}),
+            )
+            .await;
+        }
+    }
+
     // Chaining can fail (e.g. response expired server-side): retry with the
     // full request and reset the conversation state.
     if linked && !upstream.status().is_success() {
@@ -1483,7 +1674,10 @@ async fn handle_openai(
             "[opencc] delta failed ({}): retrying without chaining",
             upstream.status()
         );
-        upstream = match full_fetch(&auth.0, &auth.1).send().await {
+        upstream = match fetch(&full_request(&responses_req), &auth.0, &auth.1)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(err) => {
                 return json_response(
@@ -1847,6 +2041,30 @@ async fn send_translated(
     true
 }
 
+/// No event from the upstream for this long mid-response: the connection is
+/// wedged. Failing the turn beats hanging the agent on it forever.
+const WS_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Terminates the stream with an Anthropic `error` event. Used when the
+/// upstream dies mid-response: without it the client receives a well-formed
+/// but empty assistant turn, which reads as success.
+async fn fail_stream(state: &mut StreamState, sender: &mut Option<StreamSender>, message: String) {
+    eprintln!("[opencc] stream failed: {message}");
+    state.failed = Some(message.clone());
+    if let Some(s) = sender.as_mut() {
+        let data = json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
+        });
+        if s.send_data(Bytes::from(format_sse("error", &data)))
+            .await
+            .is_err()
+        {
+            *sender = None; // client gone
+        }
+    }
+}
+
 /// State needed to remember (or forget) a conversation for turn chaining.
 struct ChainContext {
     key: Option<String>,
@@ -1922,8 +2140,8 @@ async fn finalize_stream(
         }
     }
     if let Some(key) = &chain.key {
-        if let Some(resp_id) = state.resp_id.clone() {
-            ctx.conversations.remember(
+        match state.resp_id.clone() {
+            Some(resp_id) => ctx.conversations.remember(
                 key,
                 ConvState {
                     last_response_id: resp_id,
@@ -1932,7 +2150,13 @@ async fn finalize_stream(
                     props: chain.props,
                     cumulative: chain.cached_est + chain.est_this,
                 },
-            );
+            ),
+            // The turn produced no response id (it failed or was cut short).
+            // Whatever id we still hold points at a response the next turn
+            // cannot chain onto: keeping it means the next turn chains,
+            // gets rejected upstream, and pays a full resend to find out.
+            // Drop it and let the next turn start a fresh chain.
+            None => ctx.conversations.forget(key),
         }
     }
     let mut su = state.stream_usage.clone().unwrap_or_default();
@@ -2022,9 +2246,18 @@ async fn stream_translation(
     let mut sender: Option<StreamSender> = Some(sender);
 
     let mut chunks = upstream.bytes_stream();
+    // Set when the body ended early: a transport error, or a stream that
+    // stopped before response.completed. Reported as an error event rather
+    // than as an empty assistant turn.
+    let mut broken: Option<String> = None;
     'outer: loop {
-        let Some(Ok(chunk)) = chunks.next().await else {
-            break;
+        let chunk = match chunks.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(err)) => {
+                broken = Some(format!("upstream stream error: {err}"));
+                break;
+            }
+            None => break,
         };
         for line in parser.feed(&chunk) {
             if sender.is_none() {
@@ -2050,6 +2283,15 @@ async fn stream_translation(
         }
     }
 
+    // A body that ended without response.completed is a failed turn, not an
+    // empty one. Saying so lets Claude Code surface the failure instead of
+    // silently retrying against an assistant turn that produced nothing.
+    if sender.is_some() && state.failed.is_none() && state.resp_id.is_none() {
+        let reason = broken.unwrap_or_else(|| {
+            "the upstream ended the stream before completing the response".to_string()
+        });
+        fail_stream(&mut state, &mut sender, reason).await;
+    }
     finalize_stream(&ctx, &mut sender, &mut state, original_model, spec, chain).await;
     drop(sender); // end of the stream body
 }
@@ -2076,6 +2318,11 @@ async fn ws_stream_translation(
     let mut sender: Option<StreamSender> = Some(sender);
     let mut pending: Option<Value> = Some(first);
     let mut aborted = false;
+    // Set when the response ended without a terminal event: the socket died
+    // mid-response, or went quiet long enough to be considered wedged. Either
+    // way the connection is unusable and must not go back into the pool.
+    let mut broken: Option<String> = None;
+    let mut completed = false;
     loop {
         if sender.is_none() {
             aborted = true;
@@ -2083,9 +2330,24 @@ async fn ws_stream_translation(
         }
         let evt = match pending.take() {
             Some(v) => v,
-            None => match rx.recv().await {
-                Some(v) => v,
-                None => break,
+            None => match tokio::time::timeout(WS_STREAM_IDLE_TIMEOUT, rx.recv()).await {
+                Ok(Some(v)) => v,
+                // The reader task ended: the upstream closed the socket
+                // before completing the response.
+                Ok(None) => {
+                    broken = Some(
+                        "the upstream closed the connection before completing the response"
+                            .to_string(),
+                    );
+                    break;
+                }
+                Err(_) => {
+                    broken = Some(format!(
+                        "no response from the upstream for {}s",
+                        WS_STREAM_IDLE_TIMEOUT.as_secs()
+                    ));
+                    break;
+                }
             },
         };
         // The connection stays open for the next request: stop consuming at
@@ -2102,15 +2364,23 @@ async fn ws_stream_translation(
             break;
         }
         if terminal {
+            completed = true;
             break;
         }
     }
+    if let Some(reason) = broken {
+        fail_stream(&mut state, &mut sender, reason).await;
+    }
     finalize_stream(&ctx, &mut sender, &mut state, original_model, spec, chain).await;
-    if aborted {
+    // Only a connection that carried a complete response goes back into the
+    // pool. Returning a dead receiver here is what used to hand the next turn
+    // a corpse: it would write into a closed socket, wait out the first-event
+    // timeout, and pay a full resend to discover the connection was gone.
+    if completed && !aborted {
+        ctx.ws_sessions.release(&key, gen, rx);
+    } else {
         ctx.ws_sessions.kill(&key, gen);
         ctx.conversations.forget(&key);
-    } else {
-        ctx.ws_sessions.release(&key, gen, rx);
     }
     drop(sender); // end of the stream body
 }
