@@ -1,4 +1,4 @@
-# install.ps1 — installs opencc (wrapper + proxy) on Windows.
+﻿# install.ps1 — installs opencc (wrapper + proxy) on Windows.
 # Linux/macOS: use install.sh.
 #
 # Binary source, in order of preference:
