@@ -36,7 +36,9 @@ jobs:
           - aarch64-unknown-linux-gnu.2.17
           - armv7-unknown-linux-gnueabihf.2.17
           - arm-unknown-linux-gnueabihf.2.17
-          - riscv64gc-unknown-linux-gnu.2.17
+          # riscv64 did not exist before glibc 2.27, so .2.17 is not a
+          # valid target for it (zig rejects the triple outright).
+          - riscv64gc-unknown-linux-gnu.2.27
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
           - x86_64-pc-windows-gnu
@@ -67,17 +69,20 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          # Asset name without the glibc suffix.
+          # Asset name without the glibc suffix. rustc knows only the bare
+          # triple, so that is also where cargo puts the artifacts.
           name="${target%%.*}"
+          # Windows targets are built as opencc.exe. The binaries were
+          # previously copied as `opencc` and renamed afterwards, which meant
+          # the copy itself could never find them.
+          ext=""
+          case "$name" in *-pc-windows-*) ext=".exe" ;; esac
           bin_dir="target/${target}/release"
-          [ -f "$bin_dir/opencc" ] || bin_dir="target/${name}/release"
+          [ -f "${bin_dir}/opencc${ext}" ] || bin_dir="target/${name}/release"
           mkdir -p dist
-          cp "$bin_dir/opencc" "dist/opencc-${name}"
-          cp "$bin_dir/opencc-proxy" "dist/opencc-proxy-${name}"
-          if [[ "${target}" == *pc-windows-gnu ]]; then
-            mv "dist/opencc-${name}" "dist/opencc-${name}.exe"
-            mv "dist/opencc-proxy-${name}" "dist/opencc-proxy-${name}.exe"
-          fi
+          cp "${bin_dir}/opencc${ext}"       "dist/opencc-${name}${ext}"
+          cp "${bin_dir}/opencc-proxy${ext}" "dist/opencc-proxy-${name}${ext}"
+          ls -la dist/
       - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.target }}
