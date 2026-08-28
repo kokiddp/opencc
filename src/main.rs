@@ -20,6 +20,7 @@
 //!   OPENCC_PROXY_PORT local proxy port (default 3199, openai and opencode)
 
 use clap::Parser;
+use opencc::interactive;
 use opencc::menus;
 use opencc::models::{
     self, build_models_cache, fetch_openai_apikey_models, fetch_openai_subscription_models,
@@ -127,6 +128,10 @@ fn codex_login_or_fail() -> bool {
 fn run(args: &[OsString]) -> ExitCode {
     migrate_state();
 
+    // Interactive pickers need real terminals for stdin (input) and stderr
+    // (rendering); otherwise fall back to the classic numbered text menus.
+    let interactive = interactive::is_tty();
+
     // 2) Backend selection.
     let backend = match std::env::var("OPENCC_BACKEND") {
         Ok(value) => match normalize_backend(&value) {
@@ -138,7 +143,15 @@ fn run(args: &[OsString]) -> ExitCode {
         },
         Err(_) => {
             let default = read_last_backend();
-            menus::choose_backend(&mut stdin_buf(), &mut std::io::stdout(), &default)
+            match pick(
+                interactive,
+                "backend selection",
+                || menus::choose_backend(&mut stdin_buf(), &mut std::io::stdout(), &default),
+                || interactive::choose_backend(&default),
+            ) {
+                Ok(b) => b,
+                Err(code) => return code,
+            }
         }
     };
     let _ = state::write_atomic_text(
@@ -210,12 +223,22 @@ fn run(args: &[OsString]) -> ExitCode {
                 "ChatGPT authentication not found ({} missing or without a token).",
                 state::codex_auth_path().display()
             );
-            if menus::ask_yes_no(
-                "Log in now (device flow via Codex)? [y/N] ",
-                &mut stdin_buf(),
-                &mut std::io::stdout(),
-            ) && !codex_login_or_fail()
-            {
+            let login_now = match pick(
+                interactive,
+                "login",
+                || {
+                    menus::ask_yes_no(
+                        "Log in now (device flow via Codex)? [y/N] ",
+                        &mut stdin_buf(),
+                        &mut std::io::stdout(),
+                    )
+                },
+                interactive::ask_login,
+            ) {
+                Ok(b) => b,
+                Err(code) => return code,
+            };
+            if login_now && !codex_login_or_fail() {
                 return ExitCode::FAILURE;
             }
             if !has_codex_auth() {
@@ -271,8 +294,18 @@ fn run(args: &[OsString]) -> ExitCode {
     } else {
         &format!("OpenAI models (auth: {mode}):")
     };
-    menus::print_model_list(&models, &last_used, header, &mut std::io::stdout());
-    let model = menus::choose_model(&mut stdin_buf(), &mut std::io::stdout(), &models, &default);
+    let model = match pick(
+        interactive,
+        "model selection",
+        || {
+            menus::print_model_list(&models, &last_used, header, &mut std::io::stdout());
+            menus::choose_model(&mut stdin_buf(), &mut std::io::stdout(), &models, &default)
+        },
+        || interactive::choose_model(header, &models, &default, &last_used),
+    ) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
 
     // 6) Reasoning level (effort). On the opencode backend, `toggle` models
     // (always-on reasoning) expose no levels: the prompt is skipped.
@@ -296,13 +329,23 @@ fn run(args: &[OsString]) -> ExitCode {
     let effort = if valid_efforts.is_empty() {
         String::new()
     } else {
-        menus::choose_effort(
-            &mut stdin_buf(),
-            &mut std::io::stdout(),
-            &valid_efforts,
-            &effort_saved,
-            &model_default,
-        )
+        match pick(
+            interactive,
+            "effort selection",
+            || {
+                menus::choose_effort(
+                    &mut stdin_buf(),
+                    &mut std::io::stdout(),
+                    &valid_efforts,
+                    &effort_saved,
+                    &model_default,
+                )
+            },
+            || interactive::choose_effort(&valid_efforts, &effort_saved, &model_default),
+        ) {
+            Ok(e) => e,
+            Err(code) => return code,
+        }
     };
 
     // Claude Code sends efforts low..max in output_config.effort. `ultra` is
@@ -458,6 +501,33 @@ fn run(args: &[OsString]) -> ExitCode {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Runs one prompt: the inquire picker when `interactive`, else the classic
+/// text menu (also used if the terminal vanished mid-run). `Err(exit code)`
+/// means the user aborted (Esc/Ctrl+C) or the picker failed.
+fn pick<T>(
+    interactive: bool,
+    label: &str,
+    text: impl FnOnce() -> T,
+    picker: impl FnOnce() -> interactive::Pick<T>,
+) -> Result<T, ExitCode> {
+    if !interactive {
+        return Ok(text());
+    }
+    match picker() {
+        interactive::Pick::Chosen(v) => Ok(v),
+        interactive::Pick::NotTty => Ok(text()),
+        interactive::Pick::Canceled => {
+            eprintln!("Aborted.");
+            Err(ExitCode::FAILURE)
+        }
+        interactive::Pick::Interrupted => Err(ExitCode::from(130)),
+        interactive::Pick::Error(msg) => {
+            eprintln!("Error: {label}: {msg}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
 
 fn stdin_buf() -> BufReader<std::io::Stdin> {
     BufReader::new(std::io::stdin())

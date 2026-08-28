@@ -1,5 +1,7 @@
-//! Interactive menus, written against `BufRead`/`Write` so they are testable
-//! with injected streams (the wrapper wires stdin/stdout).
+//! Classic numbered text menus, written against `BufRead`/`Write` so they
+//! are testable with injected streams. They are the fallback when stdin is
+//! not a terminal (pipes, scripts, CI); on a real terminal
+//! [`crate::interactive`] runs the arrow-key/mouse pickers instead.
 
 use std::io::{BufRead, Write};
 
@@ -50,6 +52,18 @@ pub fn choose_backend(input: &mut impl BufRead, output: &mut impl Write, default
     }
 }
 
+/// One-line model description shared by the text menu and the interactive
+/// picker: `"GPT-5.6 Sol  [828K]  (last used)"`.
+pub fn model_label(display: &str, context: u64, last_used: bool) -> String {
+    let ctx = if context > 0 {
+        format!("  [{}]", crate::util::fmt_ctx(context))
+    } else {
+        String::new()
+    };
+    let tag = if last_used { "  (last used)" } else { "" };
+    format!("{display}{ctx}{tag}")
+}
+
 /// Prints the numbered model list. `last_used` gets a "(last used)" marker.
 pub fn print_model_list(
     models: &[crate::models::Model],
@@ -59,17 +73,12 @@ pub fn print_model_list(
 ) {
     let _ = writeln!(output, "{header}");
     for (i, m) in models.iter().enumerate() {
-        let ctx = if m.context > 0 {
-            format!("  [{}]", crate::util::fmt_ctx(m.context))
-        } else {
-            String::new()
-        };
-        let tag = if m.slug == last_used {
-            "  (last used)"
-        } else {
-            ""
-        };
-        let _ = writeln!(output, "  {:2}) {}{}{}", i + 1, m.display, ctx, tag);
+        let _ = writeln!(
+            output,
+            "  {:2}) {}",
+            i + 1,
+            model_label(&m.display, m.context, m.slug == last_used)
+        );
     }
 }
 
@@ -211,6 +220,18 @@ mod tests {
         assert_eq!(
             run("0\nx\n1\n", |i, o| choose_model(i, o, &models, "a")),
             "a"
+        );
+    }
+
+    #[test]
+    fn model_label_formats_context_and_marker() {
+        assert_eq!(model_label("M", 828_400, false), "M  [828K]");
+        assert_eq!(model_label("M", 828_400, true), "M  [828K]  (last used)");
+        assert_eq!(model_label("M", 0, true), "M  (last used)");
+        assert_eq!(model_label("M", 0, false), "M");
+        assert_eq!(
+            model_label("GPT-5.6 Sol", 1_000_000, true),
+            "GPT-5.6 Sol  [1M]  (last used)"
         );
     }
 

@@ -3,6 +3,7 @@
 //! the `opencc-proxy` server binary.
 
 pub mod effort;
+pub mod interactive;
 pub mod menus;
 pub mod models;
 pub mod picker;

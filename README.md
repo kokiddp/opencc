@@ -9,11 +9,15 @@ native local proxy (no Node, no Python, no curl):
 | `opencode` | the [opencode-go](https://opencode.ai/zen/go) gateway from OpenCode | `x-api-key` header | yes (Anthropic pass-through) |
 | `anthropic`| stock Claude Code | unchanged (native behavior) | no |
 
-On the `openai` and `opencode` backends: numbered model menu with context
-size, **reasoning level** selection, memory of the last choice (per backend)
-and automatic configuration of Claude Code's environment variables. The
-`anthropic` backend is a pure pass-through: it launches `claude` without
-touching endpoint, authentication, model, effort or settings.
+On the `openai` and `opencode` backends: interactive pickers for the
+**backend**, the **model** (with context size and a marker for the last one
+used) and the **reasoning level**, with **arrow-key and mouse navigation**
+and type-to-fuzzy-filter on long model lists. The last choice is remembered
+(per backend) and pre-highlighted, and Claude Code's environment variables
+are configured automatically. When stdin is not a terminal (scripts, pipes),
+the classic numbered text menus are used instead. The `anthropic` backend is
+a pure pass-through: it launches `claude` without touching endpoint,
+authentication, model, effort or settings.
 
 Everything is compiled: the wrapper and the proxy are two static-friendly
 Rust binaries with **no runtime dependencies** beyond `claude` itself
@@ -90,21 +94,32 @@ opencc login                   # generates/refreshes ~/.codex/auth.json (device 
 opencc [args for claude]       # backend + model + reasoning menu, then launches
 ```
 
-At startup `opencc` asks for:
+In a terminal, `opencc` asks with interactive pickers (arrow keys **and**
+mouse work; typing filters the list):
 
 1. the **backend**:
-   - `1` `openai` — OpenAI models (local proxy);
-   - `2` `opencode` — OpenCode gateway;
-   - `0` `anthropic` — stock Claude Code (pass-through, no changes).
+   - `openai` — OpenAI models (local proxy);
+   - `opencode` — OpenCode gateway;
+   - `anthropic` — stock Claude Code (pass-through, no changes).
 
-   The default is the last one used; the menu can be skipped by setting
+   The last one used is pre-highlighted; the menu can be skipped by setting
    `OPENCC_BACKEND=openai|opencode|anthropic` (the legacy value `go` is still
    accepted and normalized to `opencode`).
-2. the **model**, with context size and a marker for the last one used;
+2. the **model**, with context size and a marker for the last one used
+   (typing filters it: e.g. `gpt-5` narrows the list);
 3. the **reasoning level** valid for that model.
 
-Press enter (or `d`) to accept the defaults. On the `opencode` backend,
-models with always-on reasoning (e.g. `minimax-m3`) skip step 3.
+**Enter** accepts the highlighted (default) option, **Esc** aborts with
+exit code 1, **Ctrl+C** exits with 130. The **mouse** works too: hovering
+highlights the row under the pointer, a click selects it, the wheel moves
+the highlight. When stdin is not a terminal (scripts, pipes), `opencc`
+falls back to the classic numbered text menus, where enter (or `d`) accepts
+the defaults. On the `opencode` backend, models with always-on reasoning
+(e.g. `minimax-m3`) skip step 3.
+
+> **Terminals:** the mouse needs a terminal that forwards mouse events
+> (tmux: `set -g mouse on`; most SSH clients work). Keyboard navigation
+> always works.
 
 ## Changing model and reasoning mid-session
 

@@ -1,6 +1,6 @@
 [package]
 name = "opencc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Run Claude Code against alternative backends (OpenAI, OpenCode) through a local proxy"
 license = "MIT"
@@ -20,6 +20,7 @@ path = "src/bin/opencc-proxy.rs"
 [dependencies]
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 dirs = "6"
 futures-util = "0.3"
 http-body-util = { version = "0.1", features = ["channel"] }
@@ -36,4 +37,4 @@ which = "7"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }

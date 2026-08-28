@@ -30,7 +30,7 @@ install.sh                     (updated: installs the two binaries)
 README.md                      (updated)
 ```
 
-lib modules: `state` (platform paths, atomic write, session registry, process-alive), `models` (fetch + TSV cache), `effort` (policy + normalization), `picker` (model-picker.json / model-efforts.json), `proxy` (HTTP server, translation, SSE, turn chaining, OAuth refresh), `menus` (testable menu prompts). Crate is private (name collides with crates.io `opencc` — do not publish).
+lib modules: `state` (platform paths, atomic write, session registry, process-alive), `models` (fetch + TSV cache), `effort` (policy + normalization), `picker` (model-picker.json / model-efforts.json), `proxy` (HTTP server, translation, SSE, turn chaining, OAuth refresh), `menus` (numbered text menus, the non-TTY fallback), `interactive` (custom crossterm arrow-key/mouse pickers, TTY-only — no prompt library has mouse support). Crate is private (name collides with crates.io `opencc` — do not publish).
 
 ### Dependencies
 
@@ -51,7 +51,7 @@ lib modules: `state` (platform paths, atomic write, session registry, process-al
 - **Migration**: `state/go/` → `state/opencode/` (move if destination missing); `last-backend` containing `go` → `opencode`; `OPENCC_BACKEND=go` still accepted, normalized to `opencode`.
 - Backend menu: `1) openai`, `2) opencode`, `0) anthropic`, default = last used, enter/`d` accepts. `anthropic` → spawn `claude "$@"`, propagate exit code.
 - Credentials: `OPENCODE_API_KEY` → fallback `~/.local/share/opencode/auth.json` (serde, no python). OpenAI subscription/apikey modes identical to bash (offer login when missing).
-- Model + effort menus: byte-for-byte UX parity with bash (numbered list, `[ctx]`, `(last used)`, enter/d defaults, `ultra` encoded as `model@ultra`).
+- Model + effort menus: byte-for-byte UX parity with bash (numbered list, `[ctx]`, `(last used)`, enter/d defaults, `ultra` encoded as `model@ultra`). On a real terminal the numbered menus are replaced by custom crossterm pickers (`interactive` module: arrow keys + mouse hover highlight + click select + wheel, type-to-filter, pre-highlighted last used, no help hint, Esc = abort exit 1, Ctrl+C = 130, effort sentinel "use the model default" when the last level is invalid; the prompt origin for click mapping comes from a DSR read-back after the first draw, with a bottom-of-screen anchor fallback).
 - Save `last-model` / `last-effort`.
 - Generate picker + policy JSON.
 - Proxy lifecycle: check `TcpListener::bind(127.0.0.1:$PORT)` → free (then spawn) or in-use (error); health-check `/health` for version+mode match (reject mismatched/foreign proxy — covers an old node proxy still running); spawn sibling `opencc-proxy` (`current_exe().parent()`), detached via `pre_exec(setsid)` on unix **with stdin/stdout/stderr → /dev/null / proxy.log** (setsid alone doesn't detach the tty fd), write `proxy.pid`; wait-for-health loop (25 × 100ms).
