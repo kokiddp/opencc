@@ -50,7 +50,12 @@ jobs:
         run: rustup target add "${TARGET%%.*}"
         env:
           TARGET: ${{ matrix.target }}
-      - uses: mlugg/setup-zig@v1
+      # v2 or newer is required: v1 requests the pre-0.14.1 tarball name
+      # (zig-linux-x86_64-<ver>) which no longer exists, so every mirror
+      # 404s. v2.0.1 added the current zig-<arch>-<os>-<ver> naming, and
+      # v2.2.0 added a hardcoded mirror fallback for when the community
+      # mirrors are down.
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.1
       - uses: taiki-e/install-action@v2
@@ -73,7 +78,7 @@ jobs:
             mv "dist/opencc-${name}" "dist/opencc-${name}.exe"
             mv "dist/opencc-proxy-${name}" "dist/opencc-proxy-${name}.exe"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.target }}
           path: dist/
@@ -100,7 +105,7 @@ jobs:
           mkdir -p dist
           cp "target/${target}/release/opencc" "dist/opencc-${target}"
           cp "target/${target}/release/opencc-proxy" "dist/opencc-proxy-${target}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.target }}
           path: dist/
@@ -119,7 +124,7 @@ jobs:
         run: |
           VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
