@@ -45,7 +45,12 @@ $Triple = switch ($Arch) {
   'x86_64' { 'x86_64-pc-windows-gnu' }
   'i686'   { 'i686-pc-windows-gnu' }
 }
-Log "Detected: windows/$Arch (release asset: $Triple)"
+# Release asset name: the `unknown-` segment of the Rust triple is dropped
+# in the release asset names (x86_64-pc-windows-gnu has none, but keep the
+# rule uniform). $Triple itself stays the real triple: that is where cargo
+# puts local builds.
+$AssetName = $Triple -replace 'unknown-', ''
+Log "Detected: windows/$Arch (release asset: $AssetName)"
 
 # --- 1) Claude Code ------------------------------------------------------------
 $Claude = Get-Command claude -ErrorAction SilentlyContinue
@@ -109,7 +114,10 @@ if (-not $SrcDir) {
   New-Item -ItemType Directory -Path $Tmp | Out-Null
   $downloaded = $false
   try {
-    foreach ($asset in @("opencc-$Triple.exe", "opencc-proxy-$Triple.exe", 'sha256sums.txt')) {
+    # Download the platform archive (that is what sha256sums.txt references)
+    # and verify its checksum. The archive contains opencc.exe,
+    # opencc-proxy.exe, install.ps1 and README.md.
+    foreach ($asset in @("opencc-$AssetName.zip", 'sha256sums.txt')) {
       curl.exe -fsSL -o (Join-Path $Tmp $asset) "$Base/$asset"
       if ($LASTEXITCODE -ne 0) {
         Die "cannot download $Base/$asset — is the release published? (drafts are not downloadable)"
@@ -117,16 +125,15 @@ if (-not $SrcDir) {
     }
     # Verify the checksums.
     $sums = Get-Content (Join-Path $Tmp 'sha256sums.txt')
-    foreach ($name in @("opencc-$Triple.exe", "opencc-proxy-$Triple.exe")) {
+    foreach ($name in @("opencc-$AssetName.zip")) {
       $expected = ($sums | Where-Object { $_ -match [regex]::Escape($name) } | ForEach-Object { ($_ -split '\s+')[0] }) -join ''
       if (-not $expected) { Die "no checksum found for $name" }
       $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $Tmp $name)).Hash.ToLower()
       if ($actual -ne $expected.ToLower()) { Die "checksum verification failed for $name" }
     }
-    # Rename to the plain names the install step expects.
-    Rename-Item (Join-Path $Tmp "opencc-$Triple.exe") 'opencc.exe'
-    Rename-Item (Join-Path $Tmp "opencc-proxy-$Triple.exe") 'opencc-proxy.exe'
-    $SrcDir = $Tmp
+    # Extract to the plain names the install step expects.
+    Expand-Archive -Path (Join-Path $Tmp "opencc-$AssetName.zip") -DestinationPath $Tmp -Force
+    $SrcDir = Join-Path $Tmp "opencc-$AssetName"
     $downloaded = $true
   } finally {
     # On failure, drop the partial download; on success it is kept until the

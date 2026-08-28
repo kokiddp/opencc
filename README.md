@@ -38,9 +38,10 @@ the first available source, in this order:
 3. the **latest GitHub release** for the detected platform, downloaded and
    verified against `sha256sums.txt`.
 
-For example, on an ARMv6 Raspberry Pi 0/1 the installer downloads
-`arm-unknown-linux-gnueabihf`; on a musl system (Alpine) it prefers the fully
-static `x86_64-unknown-linux-musl` build, which runs anywhere.
+For example, on an ARMv6 Raspberry Pi 0/1 the installer downloads the
+`opencc-arm-linux-gnueabihf.tar.gz` archive; on a musl system (Alpine) it
+prefers the fully static `opencc-x86_64-linux-musl.tar.gz`, which runs
+anywhere.
 
 The scripts check that **Claude Code** (`claude`) is installed — if it is
 missing, they offer to install it (official installer via `curl`, `npm` as a
@@ -285,9 +286,11 @@ opencode/            last-model, last-effort, model-picker.json,
 
 ## Supported platforms
 
-The release workflow builds and attaches binaries for every target below
-(`opencc-<triple>` + `opencc-proxy-<triple>`, `.exe` on Windows, plus
-`sha256sums.txt`):
+The release workflow builds and attaches a self-contained package for every
+target below (`opencc-<arch>-<os>.tar.gz`, `.zip` on Windows, plus
+`sha256sums.txt`). Each package contains both binaries and the platform's
+installer — `install.sh` (Linux/macOS) or `install.ps1` (Windows) — plus the
+README:
 
 | Family | Architectures |
 |--------|---------------|

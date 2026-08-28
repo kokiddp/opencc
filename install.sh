@@ -69,7 +69,13 @@ case "$OS-$ARCH" in
   *) die "no release binary for $OS/$ARCH — build from source (cargo build --release)." ;;
 esac
 
-log "Detected: $OS/$ARCH (release asset: $TRIPLE)"
+# Release asset name: the `unknown-` segment of the Rust triple is dropped
+# in the release asset names (x86_64-unknown-linux-musl → x86_64-linux-musl).
+# $TRIPLE itself stays the real triple: that is where cargo puts local
+# builds and what the checksum grep needs to match against.
+ASSET="${TRIPLE//unknown-/}"
+
+log "Detected: $OS/$ARCH (release asset: $ASSET)"
 
 # On musl systems (Alpine) only the static binaries work; those exist only
 # for x86_64/aarch64.
@@ -144,10 +150,11 @@ if [[ -z "$SRC_DIR" ]]; then
 
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
-  # Download with the release asset names (that is what sha256sums.txt
-  # references), verify, then rename to the plain names the install step
-  # expects.
-  for asset in "opencc-$TRIPLE" "opencc-proxy-$TRIPLE" "sha256sums.txt"; do
+  # Download the platform archive (that is what sha256sums.txt references),
+  # verify its checksum, then extract. The archive contains opencc,
+  # opencc-proxy, install.sh and README.md.
+  archive="opencc-$ASSET.tar.gz"
+  for asset in "$archive" "sha256sums.txt"; do
     curl -fsSL -o "$TMP/$asset" "$BASE/$asset" \
       || die "cannot download $BASE/$asset — is the release published? (drafts are not downloadable)"
   done
@@ -157,11 +164,10 @@ if [[ -z "$SRC_DIR" ]]; then
   else
     CHECKSUM="shasum -a 256"
   fi
-  ( cd "$TMP" && grep -E "opencc(-proxy)?-$TRIPLE" sha256sums.txt | $CHECKSUM -c - >/dev/null ) \
-    || die "checksum verification failed for the downloaded binaries."
-  mv -f "$TMP/opencc-$TRIPLE" "$TMP/opencc"
-  mv -f "$TMP/opencc-proxy-$TRIPLE" "$TMP/opencc-proxy"
-  SRC_DIR="$TMP"
+  ( cd "$TMP" && grep -E "opencc-$ASSET" sha256sums.txt | $CHECKSUM -c - >/dev/null ) \
+    || die "checksum verification failed for the downloaded archive."
+  tar -xzf "$TMP/$archive" -C "$TMP"
+  SRC_DIR="$TMP/opencc-$ASSET"
 fi
 
 # --- 3) Install ----------------------------------------------------------------
