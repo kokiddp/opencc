@@ -202,10 +202,18 @@ fn build_usage_payload(model: &str, usage: &Usage) -> Value {
         usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
     let mut payload = json!({
         "model": model,
+        // The Anthropic `usage` object is flat: clients read
+        // cache_read_input_tokens / cache_creation_input_tokens at the top
+        // level. These used to appear only nested under `current_usage`, so
+        // Claude Code read the top level, found nothing, and reported zero
+        // cache on every turn however well the backend had actually cached.
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": usage.cache_read_input_tokens,
         "total_input_tokens": total_input,
         "total_output_tokens": usage.output_tokens,
+        // Kept for the wrapper's own /usage view, which reads this shape.
         "current_usage": {
             "input_tokens": usage.input_tokens,
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
@@ -680,17 +688,14 @@ struct WsEntry {
     last_used: Instant,
 }
 
-/// Live upstream WebSocket sessions kept at once. Every agent holds one for
-/// the length of its conversation, and the backend caps concurrent
-/// connections per account: without a cap here, spawning agents eventually
-/// gets new connections rejected, and every rejection costs a full resend to
-/// discover. Evicting the coldest session instead is far cheaper — it only
-/// forfeits chaining for an agent that has gone quiet.
-const MAX_WS_SESSIONS: usize = 24;
-
-/// A session with no turn for this long is dropped. The backend closes idle
-/// connections on its own; discovering that lazily costs a wedged turn.
-const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Live upstream WebSocket sessions kept at once, and how long one may sit
+/// idle. Both are ceilings, not targets: evicting a session forfeits chaining
+/// for that agent, so its next turn resends the whole conversation. A fan-out
+/// of subagents can easily exceed a low cap and spend the whole run evicting
+/// each other, so the defaults are generous and both are tunable
+/// (`OPENCC_MAX_WS_SESSIONS`, `OPENCC_WS_IDLE_SECS`) without a rebuild.
+const DEFAULT_MAX_WS_SESSIONS: usize = 64;
+const DEFAULT_WS_IDLE_SECS: u64 = 900;
 
 /// Upper bound on how long one turn may hold a session before it is assumed
 /// leaked. Well past any real turn: this only reclaims connections whose
@@ -717,6 +722,41 @@ struct WsState {
 #[derive(Default)]
 struct WsSessions {
     state: Mutex<WsState>,
+    limits: WsLimits,
+}
+
+#[derive(Clone, Copy)]
+struct WsLimits {
+    max_sessions: usize,
+    idle: Duration,
+}
+
+impl Default for WsLimits {
+    fn default() -> Self {
+        WsLimits {
+            max_sessions: DEFAULT_MAX_WS_SESSIONS,
+            idle: Duration::from_secs(DEFAULT_WS_IDLE_SECS),
+        }
+    }
+}
+
+impl WsLimits {
+    fn from_env() -> Self {
+        let d = WsLimits::default();
+        WsLimits {
+            max_sessions: std::env::var("OPENCC_MAX_WS_SESSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(d.max_sessions),
+            idle: std::env::var("OPENCC_WS_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .map(Duration::from_secs)
+                .unwrap_or(d.idle),
+        }
+    }
 }
 
 impl WsSessions {
@@ -742,7 +782,7 @@ impl WsSessions {
         let gen = loop {
             {
                 let mut st = self.state.lock().unwrap();
-                Self::evict_idle(&mut st.map);
+                Self::evict_idle(&mut st.map, self.limits);
                 if let Some(acquired) = Self::claim(&mut st.map, key) {
                     return Some(acquired);
                 }
@@ -771,8 +811,8 @@ impl WsSessions {
         let mut st = self.state.lock().unwrap();
         st.connecting.remove(key);
         let (writer, rx, abort_tx) = dialled?;
-        Self::evict_idle(&mut st.map);
-        Self::make_room(&mut st.map);
+        Self::evict_idle(&mut st.map, self.limits);
+        Self::make_room(&mut st.map, self.limits);
         st.map.insert(
             key.to_string(),
             WsEntry {
@@ -804,7 +844,7 @@ impl WsSessions {
     }
 
     /// Drops sessions that have carried no turn recently.
-    fn evict_idle(map: &mut HashMap<String, WsEntry>) {
+    fn evict_idle(map: &mut HashMap<String, WsEntry>, limits: WsLimits) {
         let now = Instant::now();
         map.retain(|_, e| {
             let idle = now.duration_since(e.last_used);
@@ -816,14 +856,14 @@ impl WsSessions {
                 // blocking the key, and the session cap, forever.
                 idle < WS_STUCK_TIMEOUT
             } else {
-                idle < WS_IDLE_TIMEOUT
+                idle < limits.idle
             }
         });
     }
 
     /// Makes room for one more session by dropping the coldest idle one.
-    fn make_room(map: &mut HashMap<String, WsEntry>) {
-        while map.len() >= MAX_WS_SESSIONS {
+    fn make_room(map: &mut HashMap<String, WsEntry>, limits: WsLimits) {
+        while map.len() >= limits.max_sessions {
             let Some(coldest) = map
                 .iter()
                 .filter(|(_, e)| !e.in_flight)
@@ -1003,7 +1043,10 @@ pub async fn run(config: Config) -> Result<(), std::io::Error> {
         .unwrap_or_else(|_| reqwest::Client::new());
     let ctx = Arc::new(ServerCtx {
         conversations: ConversationStore::default(),
-        ws_sessions: WsSessions::default(),
+        ws_sessions: WsSessions {
+            limits: WsLimits::from_env(),
+            ..Default::default()
+        },
         client,
         send_cache_key: AtomicBool::new(true),
         config,
@@ -2159,21 +2202,24 @@ async fn finalize_stream(
             None => ctx.conversations.forget(key),
         }
     }
-    let mut su = state.stream_usage.clone().unwrap_or_default();
-    // The backend does not count the reconnected context on chained turns
-    // (it reports cached=0): /usage would show the cache reads as zero even
-    // though the whole baseline is billed at cache rates. Report our own
-    // estimate of the baseline instead.
-    if chain.linked {
-        su.cache_read_input_tokens = su.cache_read_input_tokens.max(chain.cached_est);
-    }
+    let su = state.stream_usage.clone().unwrap_or_default();
+    // What the upstream actually reported, verbatim. This used to be
+    // overwritten on chained turns with the proxy's own estimate of the
+    // reconnected context, on the assumption that the backend bills that
+    // baseline at cache rates but omits it from `usage`. The assumption was
+    // never verified, and fabricating the number here made it impossible to
+    // tell a working chain from one that is quietly being billed in full.
+    // Report what the backend says; keep the estimate beside it, labelled.
     eprintln!(
-        "[opencc] usage {}: in={} cached={} out={} ({})",
+        "[opencc] usage {}: in={} cached={} out={} total_in={} ({}) est_baseline={} key={}",
         spec.id,
         su.input_tokens,
         su.cache_read_input_tokens,
         su.output_tokens,
-        if chain.linked { "delta" } else { "full" }
+        su.input_tokens + su.cache_read_input_tokens,
+        if chain.linked { "delta" } else { "full" },
+        chain.cached_est,
+        chain.key.as_deref().unwrap_or("-"),
     );
 
     if state.failed.is_some() {

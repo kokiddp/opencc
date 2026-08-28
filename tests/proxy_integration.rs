@@ -974,12 +974,15 @@ fn subscription_chains_turns_over_websocket() {
         .map(|(_, d)| d.clone())
         .unwrap();
     assert_eq!(second_delta["usage"]["input_tokens"], 4);
-    let cache_read = second_delta["usage"]["current_usage"]["cache_read_input_tokens"]
-        .as_u64()
-        .unwrap();
-    assert!(
-        cache_read > 0,
-        "chained turn must report the reconnected baseline as cache read"
+    // The usage reported to the client is the upstream's own, verbatim. The
+    // proxy used to substitute its estimate of the reconnected baseline here,
+    // on the unverified assumption that the backend bills that baseline at
+    // cache rates but leaves it out of `usage`. Fabricating it made a chain
+    // that was quietly being billed in full indistinguishable from one that
+    // was not, so the real number stands even when it is zero.
+    assert_eq!(
+        second_delta["usage"]["current_usage"]["cache_read_input_tokens"], 0,
+        "the chained turn must report the upstream's own cache figure"
     );
 
     let frames = mock.frames.lock().unwrap();
@@ -1379,4 +1382,93 @@ fn overlapping_turns_on_one_key_share_one_session() {
         "the racing turn must wait for the session, not open a second one"
     );
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The upstream's cache figures must reach the client where the Anthropic
+/// schema puts them: flat, at the top level of `usage`.
+///
+/// Regression: cache_read_input_tokens / cache_creation_input_tokens were
+/// emitted only nested under `usage.current_usage`. Claude Code reads the top
+/// level, found nothing, and reported zero cache on every turn no matter how
+/// well the backend had actually cached.
+#[test]
+fn cache_tokens_are_reported_at_the_top_level_of_usage() {
+    let mock = start_mock(|_req| {
+        MockResponse::sse(
+            200,
+            &[
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_c\",\"usage\":{\"input_tokens\":5000,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":4000,\"cache_write_tokens\":250}}}}",
+                "data: [DONE]",
+                "",
+            ],
+        )
+    });
+    let fixture = spawn_proxy(&[
+        ("OPENCC_MODE", "apikey".into()),
+        ("OPENAI_API_KEY", "test-key".into()),
+        ("OPENAI_API_BASE", format!("http://127.0.0.1:{}", mock.port)),
+    ]);
+    let c = client();
+    let base = format!("http://127.0.0.1:{}", fixture.port);
+
+    let text = c
+        .post(format!("{base}/v1/messages"))
+        .json(&json!({
+            "model": "gpt-two",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let events = parse_sse(&text);
+
+    // message_delta carries the authoritative cumulative usage.
+    let delta = events
+        .iter()
+        .find(|(e, _)| e == "message_delta")
+        .map(|(_, d)| d.clone())
+        .expect("message_delta");
+    let usage = &delta["usage"];
+    assert_eq!(
+        usage["cache_read_input_tokens"], 4000,
+        "cache reads must be top-level in usage: {usage}"
+    );
+    assert_eq!(
+        usage["cache_creation_input_tokens"], 250,
+        "cache writes must be top-level in usage: {usage}"
+    );
+    // input_tokens excludes the cached portion, Anthropic-style, so the three
+    // fields sum to the real total the backend charged for.
+    assert_eq!(usage["input_tokens"], 1000);
+    assert_eq!(usage["output_tokens"], 7);
+
+    // message_start must carry the same shape, so a client reading usage
+    // there does not see a missing field.
+    let start = events
+        .iter()
+        .find(|(e, _)| e == "message_start")
+        .map(|(_, d)| d.clone())
+        .expect("message_start");
+    let start_usage = &start["message"]["usage"];
+    assert!(
+        start_usage.get("cache_read_input_tokens").is_some(),
+        "message_start usage must expose the field: {start_usage}"
+    );
+
+    // Non-streaming responses report the same flat shape.
+    let body: Value = c
+        .post(format!("{base}/v1/messages"))
+        .json(&json!({
+            "model": "gpt-two",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 4000);
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 250);
 }
